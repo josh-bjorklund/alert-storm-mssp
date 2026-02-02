@@ -22,7 +22,7 @@ param(
 
 # Management console base URL – NO trailing slash.
 # Example: "https://usea1-123.sentinelone.net"
-$Server = "https://usea1-support3.sentinelone.net"
+$Server = "https://XXXXXXXXXX.sentinelone.net"
 
 # Threats: what analyst verdict to apply when resolving
 # Options: undefined, true_positive, false_positive, suspicious
