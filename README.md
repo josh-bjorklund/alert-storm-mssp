@@ -3,12 +3,19 @@ The MSSP version of alert storm, no site IDs needed. This will clear all alerts 
 
 PowerShell script to clear and resolve an alert storm in the SentinelOne console.
 
-In the script itself change the console URL to fit your environment. 
+Pass the console URL, your API token (as a SecureString) and the hash value as parameters. Works on Windows PowerShell 5.1 and PowerShell 7+ (Windows, macOS, Linux). Run `Get-Help ./alert-storm-mssp.ps1 -Full` for every option.
 
-At run time, provide your API key, and the hash value of the false positive or desired threat to begin resolving both threats and alerts to include both the scenarios of a false positive threats, such as a VT reputation hit, and alerts, such as someone accidentally adding a hash to a block list or STAR rule.
+The script takes the hash value of the false positive or desired threat (SHA1 or SHA256; MD5 is not supported) and resolves both threats and alerts, to include both the scenarios of a false positive threats, such as a VT reputation hit, and alerts, such as someone accidentally adding a hash to a block list or STAR rule.
 
 By default the threat and analyst verdict is false positive, but this can be changed to any value you'd like. You will also be prompted to have the option to unquarantine files if desired. 
 
-USAGE: .\alert-storm-mssp.ps1 > Follow prompts
+USAGE:
+
+```powershell
+$token = Read-Host -AsSecureString -Prompt 'API token'
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1-or-sha256>
+```
+
+Tests: `Invoke-Pester ./alert-storm-mssp.Tests.ps1` (Pester 5.5+).
 
 <img width="719" height="190" alt="image" src="https://github.com/user-attachments/assets/11e5997d-32b4-4fee-9b75-e2ffe8f7242b" />
