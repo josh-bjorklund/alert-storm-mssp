@@ -5,8 +5,16 @@ Detection and alert resolver v2.1 - Josh Bjorklund
 MSSP edition - No site IDs needed.
 
 .DESCRIPTION
-Optionally unquarantines any threats for the given hash (if the user confirms),
-then resolves both threats and STAR alerts for that hash.
+Optionally unquarantines any threats for the given hash(es) (if the user
+confirms), then resolves both threats and STAR alerts for all of them.
+
+All hashes are looked up and remediated together, not one at a time: a
+single GET /threats call (contentHashes accepts a list) finds every matching
+threat across all hashes, the user is prompted once for unquarantine, and
+the resulting threat ids are resolved as one batch. STAR alerts are resolved
+per hash algorithm (SHA1 vs SHA256, since that's what the alerts filter
+field is keyed on) in at most two batched calls covering every hash of that
+type, rather than one call per hash.
 
 Threats are first looked up with GET /threats (all filters live there). Only the
 resulting threat ids are sent to the un-quarantine and incident endpoints, which
@@ -23,9 +31,8 @@ API token, as a SecureString.
 
 .PARAMETER FileHash
 One or more SHA1 (40 hex) or SHA256 (64 hex) hashes of the files to resolve
-threats and alerts for. Each hash is processed in full (lookup, optional
-unquarantine prompt, resolve threats, resolve STAR alerts) before moving on
-to the next; duplicates are ignored.
+threats and alerts for. All hashes are looked up and remediated together as
+a single batch, not one at a time; duplicates are ignored.
 
 .PARAMETER ThreatAnalystVerdict
 Analyst verdict applied when resolving threats. Default: false_positive.
@@ -94,8 +101,6 @@ $FileHash = @($FileHash | Select-Object -Unique)
 $script:ThreatsFound = 0
 $script:ThreatsUnquarantined = 0
 $script:ThreatsResolved = 0
-# Reset per hash inside the main loop; used only for that hash's own summary line.
-$script:HashThreatsResolved = 0
 $script:AlertsResolved = 0
 $script:FailedChunks = 0
 $script:LookupFailed = $false
@@ -113,6 +118,26 @@ function Get-HashFilterKeyForAlerts {
         64 { return "sourceProcessFileHashSha256__contains" }   # SHA256
         default { throw "Unsupported hash length ($($Hash.Length)); expected SHA1 (40) or SHA256 (64)." }
     }
+}
+
+# Groups hashes by the alerts filter field they belong under (SHA1 vs SHA256),
+# since the alerts endpoint has to be told which field to match on but can
+# match a whole list of hashes of that type in one call.
+function Group-HashesByAlertFilterKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Hashes
+    )
+
+    $groups = [ordered]@{}
+    foreach ($h in $Hashes) {
+        $key = Get-HashFilterKeyForAlerts -Hash $h
+        if (-not $groups.Contains($key)) {
+            $groups[$key] = [System.Collections.Generic.List[string]]::new()
+        }
+        $groups[$key].Add($h)
+    }
+    return $groups
 }
 
 # NetworkCredential converts a SecureString to plaintext on Windows PowerShell 5.1 and PowerShell 7+ on every OS.
@@ -133,15 +158,17 @@ function Get-AffectedCount {
 
 # ================= THREATS LOOKUP ======================
 
-# Pages through GET /threats and writes only the threat ids to $SpoolPath, one per line.
+# Pages through GET /threats (contentHashes takes the whole list of hashes in
+# one call) and writes only the threat ids to $SpoolPath, one per line.
 # Returns the number of ids written. Page objects are discarded after each page.
-function Export-ThreatIdsByHash {
+function Export-ThreatIdsByHashes {
     param(
-        [string]$Hash,
+        [string[]]$Hashes,
         [string]$SpoolPath
     )
 
     $endpoint = "$Server/web/api/v2.1/threats"
+    $contentHashesParam = ($Hashes | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','
     $count = 0
     $cursor = $null
     $page = 0
@@ -150,7 +177,7 @@ function Export-ThreatIdsByHash {
     try {
         do {
             $page++
-            $uri = "${endpoint}?limit=$ThreatsPageSize&contentHashes=$([uri]::EscapeDataString($Hash))&incidentStatuses=unresolved"
+            $uri = "${endpoint}?limit=$ThreatsPageSize&contentHashes=$contentHashesParam&incidentStatuses=unresolved"
             if ($cursor) {
                 $uri += "&cursor=$([uri]::EscapeDataString($cursor))"
             }
@@ -249,7 +276,6 @@ function Send-ThreatIdChunk {
                                       -Body $body -ErrorAction Stop
         $affected = Get-AffectedCount $response
         $script:ThreatsResolved += $affected
-        $script:HashThreatsResolved += $affected
         Write-Host "[+] Chunk $ChunkNumber/${ChunkCount} affected: $affected"
     }
     catch {
@@ -260,28 +286,29 @@ function Send-ThreatIdChunk {
 
 # ================= ALERTS (STAR) =======================
 
-function Resolve-CloudDetectionAlertsByHash {
+function Resolve-CloudDetectionAlertsByHashes {
     param(
-        [string]$Hash
+        [Parameter(Mandatory = $true)]
+        [string]$HashFilterKey,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Hashes
     )
 
     $verdictEndpoint = "$Server/web/api/v2.1/cloud-detection/alerts/analyst-verdict"
     $incidentEndpoint = "$Server/web/api/v2.1/cloud-detection/alerts/incident"
 
-    $hashFilterKey = Get-HashFilterKeyForAlerts -Hash $Hash
-
     $batch = 0
-    $hashAlertsResolved = 0
+    $groupAlertsResolved = 0
 
     while ($true) {
         $batch++
 
-        # Filter unresolved STAR alerts whose source-process file hash matches
+        # Filter unresolved STAR alerts whose source-process file hash matches any of $Hashes
         $filter = @{
             limit          = $AlertsBatchLimit
             incidentStatus = "UNRESOLVED"
         }
-        $filter[$hashFilterKey] = @($Hash)
+        $filter[$HashFilterKey] = @($Hashes)
 
         # The verdict goes through its own endpoint and must be set first, while the alerts still match UNRESOLVED.
         $verdictBody = @{
@@ -294,7 +321,7 @@ function Resolve-CloudDetectionAlertsByHash {
             data   = @{ incidentStatus = "resolved" }
         } | ConvertTo-Json -Depth 5
 
-        Write-Host "[-] Alerts batch #${batch}: resolving STAR alerts for hash $Hash using filter '$hashFilterKey' ..." -ForegroundColor Cyan
+        Write-Host "[-] Alerts batch #${batch}: resolving STAR alerts for $($Hashes.Count) hash(es) using filter '$HashFilterKey' ..." -ForegroundColor Cyan
 
         try {
             Invoke-RestMethod -Uri $verdictEndpoint -Headers $Headers `
@@ -315,7 +342,7 @@ function Resolve-CloudDetectionAlertsByHash {
         Write-Host "[+] Alerts batch #$batch affected: $affected"
 
         $script:AlertsResolved += $affected
-        $hashAlertsResolved += $affected
+        $groupAlertsResolved += $affected
 
         if ($affected -lt $AlertsBatchLimit -or $affected -eq 0) {
             break
@@ -324,7 +351,7 @@ function Resolve-CloudDetectionAlertsByHash {
         Start-Sleep -Seconds $BatchDelaySeconds
     }
 
-    Write-Host "[=] Total STAR alerts resolved for hash ${Hash}: $hashAlertsResolved" -ForegroundColor Green
+    Write-Host "[=] Total STAR alerts resolved for filter '${HashFilterKey}' ($($Hashes.Count) hash(es)): $groupAlertsResolved" -ForegroundColor Green
 }
 
 # ===================== MAIN ============================
@@ -334,76 +361,70 @@ Write-Host "Console: $Server"
 Write-Host "Hashes:  $($FileHash -join ', ')"
 Write-Host ""
 
-foreach ($Hash in $FileHash) {
-    Write-Host "--- Hash: $Hash ---" -ForegroundColor Yellow
-
-    # ---- Threats: look up ids first, then ask about unquarantine, then act ----
-    $hashThreatsFound = 0
-    $lookupFailedThisHash = $false
-    $script:HashThreatsResolved = 0
-    $spoolPath = [System.IO.Path]::GetTempFileName()
+# ---- Threats: look up ids for ALL hashes at once, ask about unquarantine once, then act ----
+$spoolPath = [System.IO.Path]::GetTempFileName()
+try {
     try {
-        try {
-            $hashThreatsFound = Export-ThreatIdsByHash -Hash $Hash -SpoolPath $spoolPath
-            $script:ThreatsFound += $hashThreatsFound
-        }
-        catch {
-            Write-Error "Threat lookup failed for hash ${Hash}: $($_.Exception.Message)" -ErrorAction Continue
-            $lookupFailedThisHash = $true
-            $script:LookupFailed = $true
-        }
+        $script:ThreatsFound = Export-ThreatIdsByHashes -Hashes $FileHash -SpoolPath $spoolPath
+    }
+    catch {
+        Write-Error "Threat lookup failed: $($_.Exception.Message)" -ErrorAction Continue
+        $script:LookupFailed = $true
+    }
 
-        if (-not $lookupFailedThisHash) {
-            Write-Host "[=] Found $hashThreatsFound unresolved threats for hash $Hash" -ForegroundColor Green
+    if (-not $script:LookupFailed) {
+        Write-Host "[=] Found $($script:ThreatsFound) unresolved threats across $($FileHash.Count) hash(es)" -ForegroundColor Green
 
-            if ($hashThreatsFound -eq 0) {
-                Write-Host "[=] No threats to resolve, skipping threats step." -ForegroundColor Yellow
+        if ($script:ThreatsFound -eq 0) {
+            Write-Host "[=] No threats to resolve, skipping threats step." -ForegroundColor Yellow
+        }
+        else {
+            # BIG RED PROMPT: ASK ABOUT UNQUARANTINE (once, for all hashes together)
+            Write-Host "**********************************************************************" -ForegroundColor Red
+            Write-Host "YOU ARE ABOUT TO RESOLVE $($script:ThreatsFound) THREATS & ALERTS FOR $($FileHash.Count) HASH(ES): $($FileHash -join ', ')" -ForegroundColor Red
+            Write-Host "Optionally, you can also UNQUARANTINE any files associated with these" -ForegroundColor Red
+            Write-Host "hashes BEFORE resolving the incidents (equivalent to Threats > Unquarantine)." -ForegroundColor Red
+            Write-Host "**********************************************************************" -ForegroundColor Red
+
+            $unqChoice = Read-Host "Do you want to send UNQUARANTINE commands for these hashes first? (Y/N)"
+            $unquarantine = $unqChoice -match '^(Y|y)$'
+
+            Write-Host ""
+            if ($unquarantine) {
+                Write-Host ">>> User chose to UNQUARANTINE files before resolving incidents..." -ForegroundColor Yellow
             }
             else {
-                # BIG RED PROMPT: ASK ABOUT UNQUARANTINE
-                Write-Host "**********************************************************************" -ForegroundColor Red
-                Write-Host "YOU ARE ABOUT TO RESOLVE $hashThreatsFound THREATS & ALERTS FOR HASH: $Hash" -ForegroundColor Red
-                Write-Host "Optionally, you can also UNQUARANTINE any files associated with this" -ForegroundColor Red
-                Write-Host "hash BEFORE resolving the incidents (equivalent to Threats > Unquarantine)." -ForegroundColor Red
-                Write-Host "**********************************************************************" -ForegroundColor Red
-
-                $unqChoice = Read-Host "Do you want to send UNQUARANTINE commands for this hash first? (Y/N)"
-                $unquarantine = $unqChoice -match '^(Y|y)$'
-
-                Write-Host ""
-                if ($unquarantine) {
-                    Write-Host ">>> User chose to UNQUARANTINE files before resolving incidents..." -ForegroundColor Yellow
-                }
-                else {
-                    Write-Host ">>> Skipping unquarantine. Proceeding directly to resolve incidents..." -ForegroundColor Yellow
-                }
-
-                $chunkCount = [int][math]::Ceiling($hashThreatsFound / $ThreatsBatchLimit)
-                $script:chunkNumber = 0
-                Invoke-ForEachIdChunk -SpoolPath $spoolPath -ChunkSize $ThreatsBatchLimit -Action {
-                    param([string[]]$Ids)
-                    $script:chunkNumber++
-                    Send-ThreatIdChunk -Ids $Ids -ChunkNumber $script:chunkNumber -ChunkCount $chunkCount -Unquarantine $unquarantine
-                    if ($script:chunkNumber -lt $chunkCount) {
-                        Start-Sleep -Seconds $BatchDelaySeconds
-                    }
-                }
-
-                Write-Host "[=] Total threat incidents resolved for hash ${Hash}: $($script:HashThreatsResolved)" -ForegroundColor Green
+                Write-Host ">>> Skipping unquarantine. Proceeding directly to resolve incidents..." -ForegroundColor Yellow
             }
+
+            $chunkCount = [int][math]::Ceiling($script:ThreatsFound / $ThreatsBatchLimit)
+            $script:chunkNumber = 0
+            Invoke-ForEachIdChunk -SpoolPath $spoolPath -ChunkSize $ThreatsBatchLimit -Action {
+                param([string[]]$Ids)
+                $script:chunkNumber++
+                Send-ThreatIdChunk -Ids $Ids -ChunkNumber $script:chunkNumber -ChunkCount $chunkCount -Unquarantine $unquarantine
+                if ($script:chunkNumber -lt $chunkCount) {
+                    Start-Sleep -Seconds $BatchDelaySeconds
+                }
+            }
+
+            Write-Host "[=] Total threat incidents resolved: $($script:ThreatsResolved)" -ForegroundColor Green
         }
     }
-    finally {
-        Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
-    }
+}
+finally {
+    Remove-Item -LiteralPath $spoolPath -Force -ErrorAction SilentlyContinue
+}
 
-    # ---- Alerts ----
-    Write-Host ""
-    Resolve-CloudDetectionAlertsByHash -Hash $Hash
-    Write-Host ""
+# ---- Alerts: resolved per hash algorithm (SHA1 / SHA256), each call covering every hash of that type ----
+Write-Host ""
+$hashGroups = Group-HashesByAlertFilterKey -Hashes $FileHash
+foreach ($hashFilterKey in $hashGroups.Keys) {
+    Resolve-CloudDetectionAlertsByHashes -HashFilterKey $hashFilterKey -Hashes $hashGroups[$hashFilterKey]
 }
 
 # ---- Summary ----
+Write-Host ""
 Write-Host "=== Summary for $($FileHash.Count) hash(es): $($FileHash -join ', ') ===" -ForegroundColor Yellow
 Write-Host "Threats found:          $($script:ThreatsFound)"
 Write-Host "Threats unquarantined:  $($script:ThreatsUnquarantined)"
@@ -411,7 +432,7 @@ Write-Host "Threats resolved:       $($script:ThreatsResolved)"
 Write-Host "Alerts resolved:        $($script:AlertsResolved)"
 Write-Host "Failed chunks:          $($script:FailedChunks)"
 if ($script:LookupFailed) {
-    Write-Host "Threat lookup:          FAILED for at least one hash" -ForegroundColor Red
+    Write-Host "Threat lookup:          FAILED" -ForegroundColor Red
 }
 if ($script:ThreatsFound -eq 0 -and $script:AlertsResolved -eq 0 -and -not $script:LookupFailed -and $script:FailedChunks -eq 0) {
     Write-Host "Nothing matched any of the supplied hashes (no unresolved threats or alerts)." -ForegroundColor Yellow
