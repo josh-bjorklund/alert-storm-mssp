@@ -8,7 +8,7 @@ Builds a new role with the permissions alert-storm-mssp.ps1 uses (see its .NOTES
 Needed permissions (swagger name -> console page / permission):
   Threats.view, Threats.updateIncidentStatus, Threats.updateAnalystVerdict, Threats.unquarantine  -> Endpoint Threats
   Custom Alerts.view, Custom Alerts.updateIncidentStatus, Custom Alerts.updateAnalystVerdict      -> STAR Rule Alerts
-View is included because the update permissions depend on it; without it the console answers HTTP 403.
+View is included because the console's role definition makes the update permissions depend on it; a missing View is the likely cause of an HTTP 403 on the update calls.
 
 Exit code: 0 on success (including declining the prompt), 1 if anything failed.
 

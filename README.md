@@ -26,7 +26,7 @@ Run it from a PowerShell session, or from a shell with `pwsh -Command "./alert-s
 
 ## Creating the role
 
-`create-role.ps1` creates a custom role with the permissions below, plus the permissions they depend on (View on Endpoint Threats and on STAR Rule Alerts; the console answers HTTP 403 on the update calls without them). The API has no standalone permission catalog, so it reads the numeric permission ids from an existing role in the same scope (`-TemplateRoleId`, which isn't changed), creates the new role in an account, site or group, and then checks that every permission is granted on it.
+`create-role.ps1` creates a custom role with the permissions below, which is the smallest set the scripts need. The API has no standalone permission catalog, so it reads the numeric permission ids from an existing role in the same scope (`-TemplateRoleId`, which isn't changed), creates the new role in an account, site or group, and then checks that every permission is granted on it.
 
 ```powershell
 $token = Read-Host -AsSecureString -Prompt 'API token'
@@ -34,6 +34,22 @@ $token = Read-Host -AsSecureString -Prompt 'API token'
 ```
 
 The token's user needs `Roles.create` (and permission to view the template role). Use `-SkipUnquarantine` to leave out un-quarantine, `-IncludeTemplatePermissions` to also copy everything the template grants, and `-RoleName` / `-RoleDescription` to name it. Assign the new role to the API user afterwards. Logs go to `./create-role.log`.
+
+### The new role grants 7 permissions
+
+To create the role by hand in the console, grant exactly these permissions (page and permission names as the console's role editor shows them) and nothing else:
+
+| Console page | Permission | Needed for (API permission name) |
+|---|---|---|
+| Endpoint Threats | View | `Threats.view` |
+| Endpoint Threats | Update Incident Status | `Threats.updateIncidentStatus` |
+| Endpoint Threats | Update Analyst Verdict | `Threats.updateAnalystVerdict` |
+| Endpoint Threats | Unquarantine | `Threats.unquarantine` (only if you answer Y to the un-quarantine prompt) |
+| STAR Rule Alerts | View | `Custom Alerts.view` |
+| STAR Rule Alerts | Update Incident Status | `Custom Alerts.updateIncidentStatus` |
+| STAR Rule Alerts | Update Analyst Verdict | `Custom Alerts.updateAnalystVerdict` |
+
+Both `View` permissions are listed because the role definition records each page's `View` as a dependency of that page's update permissions. A missing one is the likely cause of a 403 on the update calls. With `-SkipUnquarantine` the role grants 6 permissions.
 
 ## Required permissions
 
