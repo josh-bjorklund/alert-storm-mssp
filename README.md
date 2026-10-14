@@ -16,6 +16,14 @@ $token = Read-Host -AsSecureString -Prompt 'API token'
 ./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1-or-sha256>
 ```
 
+Several hashes are handled together as one batch (one lookup, one un-quarantine prompt). Pass them as a comma-separated list, with no quotes around the whole list:
+
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <hash1>,<hash2>,<hash3>
+```
+
+Run it from a PowerShell session, or from a shell with `pwsh -Command "./alert-storm-mssp.ps1 ... -FileHash <hash1>,<hash2>"`. `pwsh -File` hands the list over as a single string, which fails validation.
+
 Tests: `Invoke-Pester ./alert-storm-mssp.Tests.ps1` (Pester 5.5+).
 
 <img width="719" height="190" alt="image" src="https://github.com/user-attachments/assets/11e5997d-32b4-4fee-9b75-e2ffe8f7242b" />

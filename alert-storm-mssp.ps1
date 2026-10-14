@@ -5,21 +5,11 @@ Detection and alert resolver v2.1 - Josh Bjorklund
 MSSP edition - No site IDs needed.
 
 .DESCRIPTION
-Optionally unquarantines any threats for the given hash(es) (if the user
-confirms), then resolves both threats and STAR alerts for all of them.
+Optionally unquarantines any threats for the given hash(es) (if the user confirms), then resolves both threats and STAR alerts for all of them.
 
-All hashes are looked up and remediated together, not one at a time: a
-single GET /threats call (contentHashes accepts a list) finds every matching
-threat across all hashes, the user is prompted once for unquarantine, and
-the resulting threat ids are resolved as one batch. STAR alerts are resolved
-per hash algorithm (SHA1 vs SHA256, since that's what the alerts filter
-field is keyed on) in at most two batched calls covering every hash of that
-type, rather than one call per hash.
+All hashes are looked up and remediated together, not one at a time: a single GET /threats call (contentHashes accepts a list) finds every matching threat across all hashes, the user is prompted once for unquarantine, and the resulting threat ids are resolved as one batch. STAR alerts are resolved per hash algorithm (SHA1 vs SHA256, since that's what the alerts filter field is keyed on) in at most two batched calls covering every hash of that type, rather than one call per hash.
 
-Threats are first looked up with GET /threats (all filters live there). Only the
-resulting threat ids are sent to the un-quarantine and incident endpoints, which
-works around /threats/incident not passing its limit to its internal query. Ids
-are spooled to a temporary file so memory use stays flat for very large hashes.
+Threats are first looked up with GET /threats (all filters live there). Only the resulting threat ids are sent to the un-quarantine and incident endpoints, which works around /threats/incident not passing its limit to its internal query. Ids are spooled to a temporary file so memory use stays flat for very large hashes.
 
 Exit code: 0 on success (including "nothing matched"), 1 if any chunk or lookup failed.
 
@@ -30,9 +20,7 @@ Management console base URL, e.g. https://usea1-123.sentinelone.net (a trailing 
 API token, as a SecureString.
 
 .PARAMETER FileHash
-One or more SHA1 (40 hex) or SHA256 (64 hex) hashes of the files to resolve
-threats and alerts for. All hashes are looked up and remediated together as
-a single batch, not one at a time; duplicates are ignored.
+One or more SHA1 (40 hex) or SHA256 (64 hex) hashes of the files to resolve threats and alerts for. Pass them as a PowerShell array, e.g. -FileHash hash1,hash2 (no quotes around the whole list), or a variable holding an array. This needs a PowerShell session or pwsh -Command; pwsh -File delivers "hash1,hash2" as a single string, which fails validation. Hashes are lowercased and duplicates are ignored. All hashes are looked up and remediated together as a single batch, not one at a time.
 
 .PARAMETER ThreatAnalystVerdict
 Analyst verdict applied when resolving threats. Default: false_positive.
@@ -52,13 +40,20 @@ Per-call limit for STAR alert calls. Default: 500.
 .PARAMETER BatchDelaySeconds
 Delay between batches, to be gentle with rate limits (0-3600). Default: 1.
 
+.PARAMETER MaxRetries
+Retries per API call when the console answers HTTP 429 (rate limited), 0-10. Waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). Default: 5.
+
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
 ./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1-or-sha256>
 
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
-./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <hash1>, <hash2>, <hash3>
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <hash1>,<hash2>,<hash3>
+
+.EXAMPLE
+# From a shell, use -Command (pwsh -File cannot pass an array).
+pwsh -Command "./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -FileHash <hash1>,<hash2>"
 #>
 
 param(
@@ -89,13 +84,25 @@ param(
     [int]$AlertsBatchLimit = 500,
 
     [ValidateRange(0, 3600)]
-    [int]$BatchDelaySeconds = 1
+    [int]$BatchDelaySeconds = 1,
+
+    [ValidateRange(0, 10)]
+    [int]$MaxRetries = 5
 )
 
 $Server = $Server.TrimEnd('/')
 $ThreatAnalystVerdict = $ThreatAnalystVerdict.ToLowerInvariant()
 $AlertAnalystVerdict = $AlertAnalystVerdict.ToLowerInvariant()
-$FileHash = @($FileHash | Select-Object -Unique)
+
+# Lowercase and dedupe (Select-Object -Unique is case-sensitive).
+$FileHash = @($FileHash | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
+
+# GET /threats allows 10 requests per second per token; keep lookup requests at least this far apart.
+$LookupMinIntervalMs = 150
+# GET /threats takes the hashes in the URL; keep the hash list per request short enough for common proxy URL limits (~8 KB). More hashes than fit are looked up in several requests that feed the same single batch.
+$LookupMaxHashParamChars = 3500
+# Longest we will wait on a single 429, even if Retry-After asks for more.
+$RateLimitMaxWaitSeconds = 300
 
 # Run totals, reported in the final summary
 $script:ThreatsFound = 0
@@ -104,6 +111,9 @@ $script:ThreatsResolved = 0
 $script:AlertsResolved = 0
 $script:FailedChunks = 0
 $script:LookupFailed = $false
+
+# Console release (e.g. S-26.3.4) from GET /system/info; $null if it could not be read. Available for gating features by version.
+$script:ConsoleRelease = $null
 
 # ================= INTERNAL HELPERS ====================
 
@@ -114,15 +124,19 @@ function Get-HashFilterKeyForAlerts {
     )
 
     switch ($Hash.Length) {
-        40 { return "sourceProcessFileHashSha1__contains" }     # SHA1
-        64 { return "sourceProcessFileHashSha256__contains" }   # SHA256
-        default { throw "Unsupported hash length ($($Hash.Length)); expected SHA1 (40) or SHA256 (64)." }
+        40 {
+            return "sourceProcessFileHashSha1__contains" 
+        }     # SHA1
+        64 {
+            return "sourceProcessFileHashSha256__contains" 
+        }   # SHA256
+        default {
+            throw "Unsupported hash length ($($Hash.Length)); expected SHA1 (40) or SHA256 (64)." 
+        }
     }
 }
 
-# Groups hashes by the alerts filter field they belong under (SHA1 vs SHA256),
-# since the alerts endpoint has to be told which field to match on but can
-# match a whole list of hashes of that type in one call.
+# Groups hashes by the alerts filter field they belong under (SHA1 vs SHA256), since the alerts endpoint has to be told which field to match on but can match a whole list of hashes of that type in one call.
 function Group-HashesByAlertFilterKey {
     param(
         [Parameter(Mandatory = $true)]
@@ -147,6 +161,104 @@ $Headers = @{
 }
 $PlainToken = $null
 
+# ================= API CALLS (429 HANDLING) ============
+
+function Get-HttpStatusCode {
+    param($ErrorRecord)
+
+    # HttpResponseMessage (PowerShell 7+) and HttpWebResponse (Windows PowerShell 5.1) both expose StatusCode.
+    $response = $ErrorRecord.Exception.Response
+    if ($response -and $null -ne $response.StatusCode) {
+        return [int]$response.StatusCode
+    }
+    return $null
+}
+
+# Seconds from a Retry-After header (delta-seconds or HTTP date), or $null if absent or unparseable.
+function Get-RetryAfterSeconds {
+    param($ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    $value = $null
+    try {
+        if ($response.Headers -is [System.Net.Http.Headers.HttpHeaders]) {
+            $values = $null
+            if ($response.Headers.TryGetValues('Retry-After', [ref]$values)) {
+                $value = @($values)[0]
+            }
+        }
+        elseif ($response.Headers) {
+            $value = $response.Headers['Retry-After']
+        }
+    }
+    catch {
+        return $null
+    }
+
+    if ($value -match '^\s*\d+\s*$') {
+        return [int]$value
+    }
+    $date = [datetime]::MinValue
+    if ($value -and [datetime]::TryParse([string]$value, [ref]$date)) {
+        return [math]::Max(0, [int][math]::Ceiling(($date.ToUniversalTime() - [datetime]::UtcNow).TotalSeconds))
+    }
+    return $null
+}
+
+# Invoke-RestMethod that waits and retries on HTTP 429, up to $MaxRetries times. Other errors, and 429s that outlast the retries, are thrown to the caller.
+function Invoke-S1Api {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [ValidateSet('Get', 'Post')]
+        [string]$Method = 'Get',
+        [string]$Body
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            if ($Method -eq 'Post') {
+                return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Post -ContentType "application/json" `
+                    -Body $Body -ErrorAction Stop
+            }
+            return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+        }
+        catch {
+            if ((Get-HttpStatusCode $_) -ne 429) {
+                throw 
+            }
+
+            $attempt++
+            if ($attempt -gt $MaxRetries) {
+                throw "Rate limited (HTTP 429) on $Method $Uri after $MaxRetries retries: $($_.Exception.Message)"
+            }
+
+            $wait = Get-RetryAfterSeconds $_
+            if ($null -eq $wait) {
+                $wait = [math]::Min([math]::Pow(2, $attempt), 60)
+            }
+            $wait = [math]::Min($wait, $RateLimitMaxWaitSeconds)
+            Write-Warning "Rate limited (HTTP 429) on $Method $Uri; waiting ${wait}s before retry $attempt/$MaxRetries."
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
+# Returns data.release from GET /system/info, or $null (with a warning) if the call fails. Never stops the run.
+function Get-ConsoleRelease {
+    try {
+        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/system/info"
+        if ($response -and $response.data -and $response.data.release) {
+            return [string]$response.data.release
+        }
+    }
+    catch {
+        Write-Warning "Could not read console version from /system/info: $($_.Exception.Message)"
+    }
+    return $null
+}
+
 function Get-AffectedCount {
     param($Response)
 
@@ -158,9 +270,32 @@ function Get-AffectedCount {
 
 # ================= THREATS LOOKUP ======================
 
-# Pages through GET /threats (contentHashes takes the whole list of hashes in
-# one call) and writes only the threat ids to $SpoolPath, one per line.
-# Returns the number of ids written. Page objects are discarded after each page.
+# Splits hashes into lists whose comma-joined length stays within $MaxChars, so each lookup URL stays short.
+function Split-HashesForLookup {
+    param(
+        [string[]]$Hashes,
+        [int]$MaxChars
+    )
+
+    $batches = [System.Collections.Generic.List[string[]]]::new()
+    $current = [System.Collections.Generic.List[string]]::new()
+    $length = 0
+    foreach ($h in $Hashes) {
+        if ($current.Count -gt 0 -and ($length + 1 + $h.Length) -gt $MaxChars) {
+            $batches.Add($current.ToArray())
+            $current.Clear()
+            $length = 0
+        }
+        $length += $h.Length + $(if ($current.Count -gt 0) { 1 } else { 0 })
+        $current.Add($h)
+    }
+    if ($current.Count -gt 0) {
+        $batches.Add($current.ToArray())
+    }
+    return , $batches.ToArray()
+}
+
+# Pages through GET /threats (contentHashes takes the whole list of hashes in one call) and writes only the threat ids to $SpoolPath, one per line. Returns the number of ids written. Page objects are discarded after each page.
 function Export-ThreatIdsByHashes {
     param(
         [string[]]$Hashes,
@@ -168,37 +303,49 @@ function Export-ThreatIdsByHashes {
     )
 
     $endpoint = "$Server/web/api/v2.1/threats"
-    $contentHashesParam = ($Hashes | ForEach-Object { [uri]::EscapeDataString($_) }) -join ','
+    $hashBatches = Split-HashesForLookup -Hashes $Hashes -MaxChars $LookupMaxHashParamChars
     $count = 0
-    $cursor = $null
     $page = 0
 
+    $lastRequest = $null
     $writer = [System.IO.StreamWriter]::new($SpoolPath, $false)
     try {
-        do {
-            $page++
-            $uri = "${endpoint}?limit=$ThreatsPageSize&contentHashes=$contentHashesParam&incidentStatuses=unresolved"
-            if ($cursor) {
-                $uri += "&cursor=$([uri]::EscapeDataString($cursor))"
-            }
-
-            $response = Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get -ErrorAction Stop
-
-            foreach ($threat in @($response.data)) {
-                if ($threat.id) {
-                    $writer.WriteLine([string]$threat.id)
-                    $count++
-                }
-            }
-
+        foreach ($hashBatch in $hashBatches) {
+            $contentHashesParam = $hashBatch -join ','
             $cursor = $null
-            if ($response.pagination -and $response.pagination.nextCursor) {
-                $cursor = [string]$response.pagination.nextCursor
-            }
-            $response = $null
+            do {
+                $page++
+                # Keep request starts at least $LookupMinIntervalMs apart (GET /threats: 10 requests/second per token), across all hash batches.
+                if ($lastRequest) {
+                    $wait = $LookupMinIntervalMs - [int]$lastRequest.ElapsedMilliseconds
+                    if ($wait -gt 0) {
+                        Start-Sleep -Milliseconds $wait
+                    }
+                }
+                $lastRequest = [System.Diagnostics.Stopwatch]::StartNew()
+                $uri = "${endpoint}?limit=$ThreatsPageSize&contentHashes=$contentHashesParam&incidentStatuses=unresolved"
+                if ($cursor) {
+                    $uri += "&cursor=$([uri]::EscapeDataString($cursor))"
+                }
 
-            Write-Host "[-] Threat lookup page #${page}: $count ids so far ..." -ForegroundColor Cyan
-        } while ($cursor)
+                $response = Invoke-S1Api -Uri $uri -Method Get
+
+                foreach ($threat in @($response.data)) {
+                    if ($threat.id) {
+                        $writer.WriteLine([string]$threat.id)
+                        $count++
+                    }
+                }
+
+                $cursor = $null
+                if ($response.pagination -and $response.pagination.nextCursor) {
+                    $cursor = [string]$response.pagination.nextCursor
+                }
+                $response = $null
+
+                Write-Host "[-] Threat lookup page #${page}: $count ids so far ..." -ForegroundColor Cyan
+            } while ($cursor)
+        }
     }
     finally {
         $writer.Dispose()
@@ -219,7 +366,9 @@ function Invoke-ForEachIdChunk {
     try {
         $chunk = [System.Collections.Generic.List[string]]::new()
         while ($null -ne ($line = $reader.ReadLine())) {
-            if ($line) { $chunk.Add($line) }
+            if ($line) {
+                $chunk.Add($line) 
+            }
             if ($chunk.Count -ge $ChunkSize) {
                 & $Action $chunk.ToArray()
                 $chunk.Clear()
@@ -248,9 +397,7 @@ function Send-ThreatIdChunk {
         $body = @{ filter = @{ ids = $Ids } } | ConvertTo-Json -Depth 5
         Write-Host "[-] Chunk $ChunkNumber/${ChunkCount}: sending unquarantine for $($Ids.Count) threats ..." -ForegroundColor Yellow
         try {
-            $response = Invoke-RestMethod -Uri "$Server/web/api/v2.1/threats/mitigate/un-quarantine" -Headers $Headers `
-                                          -Method Post -ContentType "application/json" `
-                                          -Body $body -ErrorAction Stop
+            $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/mitigate/un-quarantine" -Method Post -Body $body
             $script:ThreatsUnquarantined += Get-AffectedCount $response
         }
         catch {
@@ -271,9 +418,7 @@ function Send-ThreatIdChunk {
 
     Write-Host "[-] Chunk $ChunkNumber/${ChunkCount}: resolving $($Ids.Count) threat incidents ..." -ForegroundColor Cyan
     try {
-        $response = Invoke-RestMethod -Uri "$Server/web/api/v2.1/threats/incident" -Headers $Headers `
-                                      -Method Post -ContentType "application/json" `
-                                      -Body $body -ErrorAction Stop
+        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/incident" -Method Post -Body $body
         $affected = Get-AffectedCount $response
         $script:ThreatsResolved += $affected
         Write-Host "[+] Chunk $ChunkNumber/${ChunkCount} affected: $affected"
@@ -324,13 +469,9 @@ function Resolve-CloudDetectionAlertsByHashes {
         Write-Host "[-] Alerts batch #${batch}: resolving STAR alerts for $($Hashes.Count) hash(es) using filter '$HashFilterKey' ..." -ForegroundColor Cyan
 
         try {
-            Invoke-RestMethod -Uri $verdictEndpoint -Headers $Headers `
-                              -Method Post -ContentType "application/json" `
-                              -Body $verdictBody -ErrorAction Stop | Out-Null
+            Invoke-S1Api -Uri $verdictEndpoint -Method Post -Body $verdictBody | Out-Null
 
-            $response = Invoke-RestMethod -Uri $incidentEndpoint -Headers $Headers `
-                                          -Method Post -ContentType "application/json" `
-                                          -Body $incidentBody -ErrorAction Stop
+            $response = Invoke-S1Api -Uri $incidentEndpoint -Method Post -Body $incidentBody
         }
         catch {
             Write-Error "Error resolving STAR alerts: $($_.Exception.Message)" -ErrorAction Continue
@@ -358,6 +499,13 @@ function Resolve-CloudDetectionAlertsByHashes {
 
 Write-Host "=== SentinelOne hash workflow: $($FileHash.Count) hash(es) ===" -ForegroundColor Yellow
 Write-Host "Console: $Server"
+$script:ConsoleRelease = Get-ConsoleRelease
+if ($script:ConsoleRelease) {
+    Write-Host "Console release: $($script:ConsoleRelease)"
+}
+else {
+    Write-Host "Console release: unknown" -ForegroundColor Yellow
+}
 Write-Host "Hashes:  $($FileHash -join ', ')"
 Write-Host ""
 
