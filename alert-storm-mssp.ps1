@@ -41,7 +41,10 @@ Per-call limit for STAR alert calls. Default: 500.
 Delay between batches, to be gentle with rate limits (0-3600). Default: 1.
 
 .PARAMETER MaxRetries
-Retries per API call when the console answers HTTP 429 (rate limited), 0-10. Waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). Default: 5.
+Retries when the console answers HTTP 429 (rate limited) or HTTP 500 (server error), 0-10. On 429 it waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). On 500 it retries the same work: the first retry keeps the batch size (a 500 is often transient), and each further consecutive 500 reduces the batch size (lookup page size, ids per un-quarantine/resolve call, or alerts per call) by 100 (never below 1), so no threat is skipped. The 500 retry count resets after any successful call; the reduced size is kept for the rest of that step. Default: 5.
+
+.PARAMETER LogPath
+File that structured logs are appended to, one logfmt line per event (key=value pairs, UTC timestamps), tagged with a run_id so many runs can share one file. Every API attempt is logged with its operation, requested batch size, outcome (ok, rate_limited, server_error, error), duration and item count, which is enough to work out which batch sizes succeed most often. The log never contains the token (only a masked form) or full URLs. Default: ./alert-storm-mssp.log (relative to the current directory). The run stops before any API call if the file cannot be written.
 
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
@@ -87,7 +90,9 @@ param(
     [int]$BatchDelaySeconds = 1,
 
     [ValidateRange(0, 10)]
-    [int]$MaxRetries = 5
+    [int]$MaxRetries = 5,
+
+    [string]$LogPath = './alert-storm-mssp.log'
 )
 
 $Server = $Server.TrimEnd('/')
@@ -97,10 +102,17 @@ $AlertAnalystVerdict = $AlertAnalystVerdict.ToLowerInvariant()
 # Lowercase and dedupe (Select-Object -Unique is case-sensitive).
 $FileHash = @($FileHash | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
 
+$script:RunId = [guid]::NewGuid().ToString('N').Substring(0, 12)
+$script:RunTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$script:LogEnabled = $false
+$script:LogFile = $null
+
 # GET /threats allows 10 requests per second per token; keep lookup requests at least this far apart.
 $LookupMinIntervalMs = 150
 # GET /threats takes the hashes in the URL; keep the hash list per request short enough for common proxy URL limits (~8 KB). More hashes than fit are looked up in several requests that feed the same single batch.
 $LookupMaxHashParamChars = 3500
+# On HTTP 500, each retry shrinks the batch by this many items.
+$BatchReductionStep = 100
 # Longest we will wait on a single 429, even if Retry-After asks for more.
 $RateLimitMaxWaitSeconds = 300
 
@@ -110,6 +122,9 @@ $script:ThreatsUnquarantined = 0
 $script:ThreatsResolved = 0
 $script:AlertsResolved = 0
 $script:FailedChunks = 0
+$script:ThreatsUnprocessed = 0
+# What the lookup saw, for the log: the API's own total (summed over each hash batch's first page) and counts by incident/mitigation status.
+$script:LookupStats = @{ ApiTotalItems = 0; Incident = @{}; Mitigation = @{} }
 $script:LookupFailed = $false
 
 # Console release (e.g. S-26.3.4) from GET /system/info; $null if it could not be read. Available for gating features by version.
@@ -154,12 +169,101 @@ function Group-HashesByAlertFilterKey {
     return $groups
 }
 
+# ================= LOGGING (logfmt) ====================
+
+# One event per line as key=value pairs (logfmt, the same shape as structlog's key-value renderer). Values with spaces, quotes or '=' are double-quoted with \ and \" escaped. Logging problems never stop the run once it has started.
+function ConvertTo-LogfmtValue {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+    if ($Value -is [bool]) {
+        return $Value.ToString().ToLowerInvariant()
+    }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0}', $Value)
+    }
+    $text = [string]$Value
+    if ($text -match '^[A-Za-z0-9_.:/@+*\-]+$') {
+        return $text
+    }
+    $text = $text.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n')
+    return '"' + $text + '"'
+}
+
+function Write-Log {
+    param(
+        [ValidateSet('info', 'warn', 'error')]
+        [string]$Level,
+        [string]$Event,
+        [System.Collections.IDictionary]$Fields
+    )
+
+    if (-not $script:LogEnabled) {
+        return
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add('ts=' + [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))
+    $parts.Add("level=$Level")
+    $parts.Add("run_id=$($script:RunId)")
+    $parts.Add('event=' + (ConvertTo-LogfmtValue $Event))
+    if ($Fields) {
+        foreach ($key in $Fields.Keys) {
+            $parts.Add("$key=" + (ConvertTo-LogfmtValue $Fields[$key]))
+        }
+    }
+
+    try {
+        [System.IO.File]::AppendAllText($script:LogFile, ($parts -join ' ') + "`n", [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        $script:LogEnabled = $false
+        Write-Warning "Logging to '$($script:LogFile)' failed and is now disabled for this run: $($_.Exception.Message)"
+    }
+}
+
+# Resolves the log path against the PowerShell location, creates its folder, and proves it is writable. Throws if not, so a run never starts unlogged.
+function Initialize-Log {
+    param([string]$Path)
+
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $dir = [System.IO.Path]::GetDirectoryName($full)
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        [void](New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop)
+    }
+    [System.IO.File]::AppendAllText($full, '', [System.Text.UTF8Encoding]::new($false))
+    $script:LogFile = $full
+    $script:LogEnabled = $true
+}
+
+# First 10 and last 10 characters with ***** between, e.g. eyJraWQiOi*****Y4HWg8hF3g. A token shorter than 40 characters is masked entirely.
+function Get-MaskedToken {
+    param([string]$Token)
+
+    if ($Token.Length -lt 40) {
+        return '*****'
+    }
+    return $Token.Substring(0, 10) + '*****' + $Token.Substring($Token.Length - 10)
+}
+
+# One red line per error, in the same style as the [-] / [+] / [=] progress lines. Write-Error prints a multi-line block that repeats the call site, which buries the message.
+function Write-ErrorLine {
+    param([string]$Message)
+
+    Write-Host "[!] $Message" -ForegroundColor Red
+}
+
 # NetworkCredential converts a SecureString to plaintext on Windows PowerShell 5.1 and PowerShell 7+ on every OS.
 $PlainToken = [System.Net.NetworkCredential]::new('', $ApiToken).Password
 $Headers = @{
     "Authorization" = "ApiToken $PlainToken"
 }
+$MaskedToken = Get-MaskedToken $PlainToken
 $PlainToken = $null
+
+Initialize-Log -Path $LogPath
 
 # ================= API CALLS (429 HANDLING) ============
 
@@ -205,31 +309,82 @@ function Get-RetryAfterSeconds {
     return $null
 }
 
-# Invoke-RestMethod that waits and retries on HTTP 429, up to $MaxRetries times. Other errors, and 429s that outlast the retries, are thrown to the caller.
+# Invoke-RestMethod that waits and retries on HTTP 429, up to $MaxRetries times. Other errors, and 429s that outlast the retries, are thrown to the caller. Every attempt is logged (event=api_attempt). -Operation, -BatchSize (items requested) and -SizeRetry (the caller's 500-retry count) are only used for the log.
 function Invoke-S1Api {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Uri,
         [ValidateSet('Get', 'Post')]
         [string]$Method = 'Get',
-        [string]$Body
+        [string]$Body,
+        [string]$Operation = 'api_call',
+        [int]$BatchSize = 0,
+        [int]$SizeRetry = 0
     )
 
+    $path = ([uri]$Uri).AbsolutePath
     $attempt = 0
     while ($true) {
+        $attempt++
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
         try {
             if ($Method -eq 'Post') {
-                return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Post -ContentType "application/json" `
+                $response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Post -ContentType "application/json" `
                     -Body $Body -ErrorAction Stop
             }
-            return Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+            else {
+                $response = Invoke-RestMethod -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+            }
+            $timer.Stop()
+
+            $fields = [ordered]@{
+                operation   = $Operation
+                method      = $Method.ToUpperInvariant()
+                endpoint    = $path
+                batch_size  = $BatchSize
+                size_retry  = $SizeRetry
+                attempt     = $attempt
+                outcome     = 'ok'
+                duration_ms = [int]$timer.ElapsedMilliseconds
+            }
+            if ($Method -eq 'Post') {
+                $fields['affected'] = Get-AffectedCount $response
+            }
+            elseif ($response -and $response.data -is [array]) {
+                $fields['returned'] = $response.data.Count
+            }
+            Write-Log info api_attempt $fields
+            return $response
         }
         catch {
-            if ((Get-HttpStatusCode $_) -ne 429) {
-                throw 
+            $timer.Stop()
+            $status = Get-HttpStatusCode $_
+            $outcome = switch ($status) {
+                429 { 'rate_limited' }
+                500 { 'server_error' }
+                default { 'error' }
+            }
+            $fields = [ordered]@{
+                operation   = $Operation
+                method      = $Method.ToUpperInvariant()
+                endpoint    = $path
+                batch_size  = $BatchSize
+                size_retry  = $SizeRetry
+                attempt     = $attempt
+                outcome     = $outcome
+                duration_ms = [int]$timer.ElapsedMilliseconds
+            }
+            if ($null -ne $status) {
+                $fields['http_status'] = $status
+            }
+            $errorText = [string]$_.Exception.Message
+            $fields['error'] = $errorText.Substring(0, [math]::Min(300, $errorText.Length))
+            Write-Log $(if ($outcome -eq 'error') { 'error' } else { 'warn' }) api_attempt $fields
+
+            if ($status -ne 429) {
+                throw
             }
 
-            $attempt++
             if ($attempt -gt $MaxRetries) {
                 throw "Rate limited (HTTP 429) on $Method $Uri after $MaxRetries retries: $($_.Exception.Message)"
             }
@@ -248,7 +403,7 @@ function Invoke-S1Api {
 # Returns data.release from GET /system/info, or $null (with a warning) if the call fails. Never stops the run.
 function Get-ConsoleRelease {
     try {
-        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/system/info"
+        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/system/info" -Operation system_info
         if ($response -and $response.data -and $response.data.release) {
             return [string]$response.data.release
         }
@@ -269,6 +424,28 @@ function Get-AffectedCount {
 }
 
 # ================= THREATS LOOKUP ======================
+
+# Adds incident_<status> and mitigation_<status> counts to a log field set. The known statuses are always present (as 0 when unseen) so lines have a stable shape; anything else the API returns is added as it appears.
+function Add-StatusFields {
+    param(
+        [System.Collections.IDictionary]$Fields,
+        [hashtable]$Incident,
+        [hashtable]$Mitigation
+    )
+
+    foreach ($k in 'unresolved', 'in_progress', 'resolved') {
+        $Fields["incident_$k"] = [int]$Incident[$k]
+    }
+    foreach ($k in @($Incident.Keys) | Where-Object { $_ -notin 'unresolved', 'in_progress', 'resolved' } | Sort-Object) {
+        $Fields["incident_$k"] = [int]$Incident[$k]
+    }
+    foreach ($k in 'not_mitigated', 'mitigated', 'marked_as_benign') {
+        $Fields["mitigation_$k"] = [int]$Mitigation[$k]
+    }
+    foreach ($k in @($Mitigation.Keys) | Where-Object { $_ -notin 'not_mitigated', 'mitigated', 'marked_as_benign' } | Sort-Object) {
+        $Fields["mitigation_$k"] = [int]$Mitigation[$k]
+    }
+}
 
 # Splits hashes into lists whose comma-joined length stays within $MaxChars, so each lookup URL stays short.
 function Split-HashesForLookup {
@@ -295,7 +472,7 @@ function Split-HashesForLookup {
     return , $batches.ToArray()
 }
 
-# Pages through GET /threats (contentHashes takes the whole list of hashes in one call) and writes only the threat ids to $SpoolPath, one per line. Returns the number of ids written. Page objects are discarded after each page.
+# Pages through GET /threats (contentHashes takes the whole list of hashes in one call) and writes only the threat ids to $SpoolPath, one per line. Returns the number of ids written. Page objects are discarded after each page. On HTTP 500 the same page is retried with a smaller page size; a page is only consumed once it succeeds, so no ids are skipped.
 function Export-ThreatIdsByHashes {
     param(
         [string[]]$Hashes,
@@ -306,6 +483,9 @@ function Export-ThreatIdsByHashes {
     $hashBatches = Split-HashesForLookup -Hashes $Hashes -MaxChars $LookupMaxHashParamChars
     $count = 0
     $page = 0
+    $pageSize = $ThreatsPageSize
+    $serverErrors = 0
+    $retriedSameSize = $false
 
     $lastRequest = $null
     $writer = [System.IO.StreamWriter]::new($SpoolPath, $false)
@@ -315,27 +495,80 @@ function Export-ThreatIdsByHashes {
             $cursor = $null
             do {
                 $page++
-                # Keep request starts at least $LookupMinIntervalMs apart (GET /threats: 10 requests/second per token), across all hash batches.
-                if ($lastRequest) {
-                    $wait = $LookupMinIntervalMs - [int]$lastRequest.ElapsedMilliseconds
-                    if ($wait -gt 0) {
-                        Start-Sleep -Milliseconds $wait
+                $firstPageOfBatch = -not $cursor
+                $response = $null
+                $succeeded = $false
+                while (-not $succeeded) {
+                    # Keep request starts at least $LookupMinIntervalMs apart (GET /threats: 10 requests/second per token), across all hash batches and retries.
+                    if ($lastRequest) {
+                        $wait = $LookupMinIntervalMs - [int]$lastRequest.ElapsedMilliseconds
+                        if ($wait -gt 0) {
+                            Start-Sleep -Milliseconds $wait
+                        }
+                    }
+                    $lastRequest = [System.Diagnostics.Stopwatch]::StartNew()
+                    $uri = "${endpoint}?limit=$pageSize&contentHashes=$contentHashesParam&incidentStatusesNin=resolved"
+                    if ($cursor) {
+                        $uri += "&cursor=$([uri]::EscapeDataString($cursor))"
+                    }
+
+                    try {
+                        $response = Invoke-S1Api -Uri $uri -Method Get -Operation threat_lookup -BatchSize $pageSize -SizeRetry $serverErrors
+                        $succeeded = $true
+                        $serverErrors = 0
+                        $retriedSameSize = $false
+                    }
+                    catch {
+                        if ((Get-HttpStatusCode $_) -ne 500) {
+                            throw
+                        }
+                        $serverErrors++
+                        if ($serverErrors -gt $MaxRetries) {
+                            Write-Log error retries_exhausted ([ordered]@{ operation = 'threat_lookup'; batch_size = $pageSize; retries = $MaxRetries })
+                            throw "Server error (HTTP 500) on threat lookup after $MaxRetries retries (page size reduced to $pageSize): $($_.Exception.Message)"
+                        }
+                        if (-not $retriedSameSize) {
+                            # A 500 may be transient, so the first retry keeps the size; only a second consecutive 500 shrinks it.
+                            $retriedSameSize = $true
+                            Write-Log warn retry_same_size ([ordered]@{ operation = 'threat_lookup'; batch_size = $pageSize; retry = $serverErrors; max_retries = $MaxRetries })
+                            Write-Warning "Server error (HTTP 500) on threat lookup; retrying the same page at the same page size $pageSize (retry $serverErrors/$MaxRetries)."
+                        }
+                        else {
+                            $previousSize = $pageSize
+                            $pageSize = [math]::Max(1, $pageSize - $BatchReductionStep)
+                            Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_lookup'; from = $previousSize; to = $pageSize; retry = $serverErrors; max_retries = $MaxRetries })
+                            Write-Warning "Server error (HTTP 500) on threat lookup; retrying the same page with page size $pageSize (retry $serverErrors/$MaxRetries)."
+                        }
+                        Start-Sleep -Seconds $BatchDelaySeconds
                     }
                 }
-                $lastRequest = [System.Diagnostics.Stopwatch]::StartNew()
-                $uri = "${endpoint}?limit=$ThreatsPageSize&contentHashes=$contentHashesParam&incidentStatuses=unresolved"
-                if ($cursor) {
-                    $uri += "&cursor=$([uri]::EscapeDataString($cursor))"
-                }
 
-                $response = Invoke-S1Api -Uri $uri -Method Get
-
+                $pageIncident = @{}
+                $pageMitigation = @{}
+                $pageReturned = 0
                 foreach ($threat in @($response.data)) {
                     if ($threat.id) {
                         $writer.WriteLine([string]$threat.id)
                         $count++
+                        $pageReturned++
+                        $incidentStatus = if ($threat.threatInfo.incidentStatus) { [string]$threat.threatInfo.incidentStatus } else { 'unknown' }
+                        $mitigationStatus = if ($threat.threatInfo.mitigationStatus) { [string]$threat.threatInfo.mitigationStatus } else { 'unknown' }
+                        $pageIncident[$incidentStatus]++
+                        $pageMitigation[$mitigationStatus]++
+                        $script:LookupStats.Incident[$incidentStatus]++
+                        $script:LookupStats.Mitigation[$mitigationStatus]++
                     }
                 }
+                $apiTotal = $response.pagination.totalItems
+                if ($firstPageOfBatch -and $null -ne $apiTotal) {
+                    $script:LookupStats.ApiTotalItems += [int]$apiTotal
+                }
+                $pageFields = [ordered]@{ page = $page; returned = $pageReturned; ids_so_far = $count }
+                if ($null -ne $apiTotal) {
+                    $pageFields['total_items'] = [int]$apiTotal
+                }
+                Add-StatusFields -Fields $pageFields -Incident $pageIncident -Mitigation $pageMitigation
+                Write-Log info lookup_page $pageFields
 
                 $cursor = $null
                 if ($response.pagination -and $response.pagination.nextCursor) {
@@ -354,57 +587,39 @@ function Export-ThreatIdsByHashes {
     return $count
 }
 
-# Reads $SpoolPath in chunks of $ChunkSize ids and invokes $Action with each chunk (a string[]).
-function Invoke-ForEachIdChunk {
-    param(
-        [string]$SpoolPath,
-        [int]$ChunkSize,
-        [scriptblock]$Action
-    )
-
-    $reader = [System.IO.StreamReader]::new($SpoolPath)
-    try {
-        $chunk = [System.Collections.Generic.List[string]]::new()
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ($line) {
-                $chunk.Add($line) 
-            }
-            if ($chunk.Count -ge $ChunkSize) {
-                & $Action $chunk.ToArray()
-                $chunk.Clear()
-            }
-        }
-        if ($chunk.Count -gt 0) {
-            & $Action $chunk.ToArray()
-        }
-    }
-    finally {
-        $reader.Dispose()
-    }
-}
-
 # ================= THREATS (UN-QUARANTINE + RESOLVE) ===
 
+# Sends one chunk of threat ids: un-quarantine (if requested and not already done for these ids), then resolve. Returns @{ Status = 'ok' | 'failed' | 'server-error'; Unquarantined = <bool> }. 'server-error' (HTTP 500) means the ids were NOT processed and the caller should retry with fewer; 'failed' is any other error.
 function Send-ThreatIdChunk {
     param(
         [string[]]$Ids,
         [int]$ChunkNumber,
-        [int]$ChunkCount,
-        [bool]$Unquarantine
+        [bool]$Unquarantine,
+        [bool]$AlreadyUnquarantined,
+        [int]$SizeRetry = 0
     )
 
-    if ($Unquarantine) {
+    $result = @{ Status = 'ok'; Unquarantined = $AlreadyUnquarantined }
+
+    if ($Unquarantine -and -not $AlreadyUnquarantined) {
         $body = @{ filter = @{ ids = $Ids } } | ConvertTo-Json -Depth 5
-        Write-Host "[-] Chunk $ChunkNumber/${ChunkCount}: sending unquarantine for $($Ids.Count) threats ..." -ForegroundColor Yellow
+        Write-Host "[-] Chunk ${ChunkNumber}: sending unquarantine for $($Ids.Count) threats ..." -ForegroundColor Yellow
         try {
-            $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/mitigate/un-quarantine" -Method Post -Body $body
+            $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/mitigate/un-quarantine" -Method Post -Body $body -Operation threat_unquarantine -BatchSize $Ids.Count -SizeRetry $SizeRetry
             $script:ThreatsUnquarantined += Get-AffectedCount $response
+            $result.Unquarantined = $true
         }
         catch {
-            # Leave the chunk unresolved so a re-run picks it up and its files are not resolved while still quarantined.
-            Write-Error "Chunk $ChunkNumber/${ChunkCount}: unquarantine failed, chunk skipped: $($_.Exception.Message)" -ErrorAction Continue
-            $script:FailedChunks++
-            return
+            if ((Get-HttpStatusCode $_) -eq 500) {
+                Write-Warning "Chunk ${ChunkNumber}: server error (HTTP 500) on unquarantine of $($Ids.Count) threats: $($_.Exception.Message)"
+                $result.Status = 'server-error'
+            }
+            else {
+                # Leave the chunk unresolved so a re-run picks it up and its files are not resolved while still quarantined.
+                Write-ErrorLine "Chunk ${ChunkNumber}: unquarantine failed, chunk skipped: $($_.Exception.Message)"
+                $result.Status = 'failed'
+            }
+            return $result
         }
     }
 
@@ -416,16 +631,108 @@ function Send-ThreatIdChunk {
         }
     } | ConvertTo-Json -Depth 5
 
-    Write-Host "[-] Chunk $ChunkNumber/${ChunkCount}: resolving $($Ids.Count) threat incidents ..." -ForegroundColor Cyan
+    Write-Host "[-] Chunk ${ChunkNumber}: resolving $($Ids.Count) threat incidents ..." -ForegroundColor Cyan
     try {
-        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/incident" -Method Post -Body $body
+        $response = Invoke-S1Api -Uri "$Server/web/api/v2.1/threats/incident" -Method Post -Body $body -Operation threat_resolve -BatchSize $Ids.Count -SizeRetry $SizeRetry
         $affected = Get-AffectedCount $response
         $script:ThreatsResolved += $affected
-        Write-Host "[+] Chunk $ChunkNumber/${ChunkCount} affected: $affected"
+        Write-Host "[+] Chunk $ChunkNumber affected: $affected"
     }
     catch {
-        Write-Error "Chunk $ChunkNumber/${ChunkCount}: error resolving threat incidents: $($_.Exception.Message)" -ErrorAction Continue
-        $script:FailedChunks++
+        if ((Get-HttpStatusCode $_) -eq 500) {
+            Write-Warning "Chunk ${ChunkNumber}: server error (HTTP 500) resolving $($Ids.Count) threat incidents: $($_.Exception.Message)"
+            $result.Status = 'server-error'
+        }
+        else {
+            Write-ErrorLine "Chunk ${ChunkNumber}: error resolving threat incidents: $($_.Exception.Message)"
+            $result.Status = 'failed'
+        }
+    }
+    return $result
+}
+
+# Streams $SpoolPath through Send-ThreatIdChunk in chunks of $ThreatsBatchLimit ids. On HTTP 500 the same ids are retried in a smaller chunk (reduced by $BatchReductionStep each time, never below 1) and nothing is dropped: ids stay in $pending until their chunk succeeds. The retry count resets on success; the reduced size is kept. After $MaxRetries consecutive 500s the step stops and the remaining ids are left unresolved (and counted).
+function Resolve-ThreatIdsFromSpool {
+    param(
+        [string]$SpoolPath,
+        [bool]$Unquarantine
+    )
+
+    $size = $ThreatsBatchLimit
+    $serverErrors = 0
+    $retriedSameSize = $false
+    $chunkNumber = 0
+    $removed = 0                # ids taken off $pending, whether they succeeded or failed
+    $unquarantinedAhead = 0     # leading ids in $pending already un-quarantined (their resolve hit a 500), so a retry does not repeat it
+    $pending = [System.Collections.Generic.List[string]]::new()
+
+    $reader = [System.IO.StreamReader]::new($SpoolPath)
+    try {
+        while ($true) {
+            while ($pending.Count -lt $size -and $null -ne ($line = $reader.ReadLine())) {
+                if ($line) {
+                    $pending.Add($line)
+                }
+            }
+            if ($pending.Count -eq 0) {
+                break
+            }
+
+            $take = [math]::Min($size, $pending.Count)
+            $ids = $pending.GetRange(0, $take).ToArray()
+            $chunkNumber++
+            $result = Send-ThreatIdChunk -Ids $ids -ChunkNumber $chunkNumber -Unquarantine $Unquarantine -AlreadyUnquarantined ($unquarantinedAhead -ge $take) -SizeRetry $serverErrors
+
+            switch ($result.Status) {
+                'ok' {
+                    $pending.RemoveRange(0, $take)
+                    $removed += $take
+                    $unquarantinedAhead = [math]::Max(0, $unquarantinedAhead - $take)
+                    $serverErrors = 0
+                    $retriedSameSize = $false
+                    if ($pending.Count -gt 0 -or $reader.Peek() -ge 0) {
+                        Start-Sleep -Seconds $BatchDelaySeconds
+                    }
+                }
+                'failed' {
+                    $pending.RemoveRange(0, $take)
+                    $removed += $take
+                    $unquarantinedAhead = [math]::Max(0, $unquarantinedAhead - $take)
+                    $script:FailedChunks++
+                    $script:ThreatsUnprocessed += $take
+                }
+                'server-error' {
+                    if ($Unquarantine -and $result.Unquarantined) {
+                        $unquarantinedAhead = [math]::Max($unquarantinedAhead, $take)
+                    }
+                    $serverErrors++
+                    if ($serverErrors -gt $MaxRetries) {
+                        $left = $script:ThreatsFound - $removed
+                        Write-Log error retries_exhausted ([ordered]@{ operation = 'threat_resolve'; batch_size = $size; retries = $MaxRetries; unprocessed_ids = $left })
+                        Write-ErrorLine "Server error (HTTP 500) persisted after $MaxRetries retries (chunk size reduced to $size). Stopping; $left threat ids were not processed and remain unresolved, so a re-run will pick them up."
+                        $script:FailedChunks++
+                        $script:ThreatsUnprocessed += $left
+                        return
+                    }
+                    if (-not $retriedSameSize) {
+                        # A 500 may be transient, so the first retry keeps the size; only a second consecutive 500 shrinks it.
+                        $retriedSameSize = $true
+                        Write-Log warn retry_same_size ([ordered]@{ operation = 'threat_resolve'; batch_size = $size; retry = $serverErrors; max_retries = $MaxRetries; pending_ids = $pending.Count })
+                        Write-Warning "Retrying the same pending ids at the same chunk size $size (retry $serverErrors/$MaxRetries)."
+                    }
+                    else {
+                        $previousSize = $size
+                        $size = [math]::Max(1, $size - $BatchReductionStep)
+                        Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_resolve'; from = $previousSize; to = $size; retry = $serverErrors; max_retries = $MaxRetries; pending_ids = $pending.Count })
+                        Write-Warning "Retrying the same $($pending.Count) pending ids in chunks of up to $size (retry $serverErrors/$MaxRetries)."
+                    }
+                    Start-Sleep -Seconds $BatchDelaySeconds
+                }
+            }
+        }
+    }
+    finally {
+        $reader.Dispose()
     }
 }
 
@@ -444,13 +751,16 @@ function Resolve-CloudDetectionAlertsByHashes {
 
     $batch = 0
     $groupAlertsResolved = 0
+    $limit = $AlertsBatchLimit
+    $serverErrors = 0
+    $retriedSameSize = $false
 
     while ($true) {
         $batch++
 
         # Filter unresolved STAR alerts whose source-process file hash matches any of $Hashes
         $filter = @{
-            limit          = $AlertsBatchLimit
+            limit          = $limit
             incidentStatus = "UNRESOLVED"
         }
         $filter[$HashFilterKey] = @($Hashes)
@@ -466,26 +776,53 @@ function Resolve-CloudDetectionAlertsByHashes {
             data   = @{ incidentStatus = "resolved" }
         } | ConvertTo-Json -Depth 5
 
-        Write-Host "[-] Alerts batch #${batch}: resolving STAR alerts for $($Hashes.Count) hash(es) using filter '$HashFilterKey' ..." -ForegroundColor Cyan
+        Write-Host "[-] Alerts batch #${batch}: resolving STAR alerts for $($Hashes.Count) hash(es) using filter '$HashFilterKey' (limit $limit) ..." -ForegroundColor Cyan
 
         try {
-            Invoke-S1Api -Uri $verdictEndpoint -Method Post -Body $verdictBody | Out-Null
+            Invoke-S1Api -Uri $verdictEndpoint -Method Post -Body $verdictBody -Operation alert_verdict -BatchSize $limit -SizeRetry $serverErrors | Out-Null
 
-            $response = Invoke-S1Api -Uri $incidentEndpoint -Method Post -Body $incidentBody
+            $response = Invoke-S1Api -Uri $incidentEndpoint -Method Post -Body $incidentBody -Operation alert_resolve -BatchSize $limit -SizeRetry $serverErrors
         }
         catch {
-            Write-Error "Error resolving STAR alerts: $($_.Exception.Message)" -ErrorAction Continue
+            if ((Get-HttpStatusCode $_) -eq 500) {
+                # The filter selects alerts server-side, so retrying with a smaller limit cannot skip any: whatever is still UNRESOLVED is picked up by the next call.
+                $serverErrors++
+                if ($serverErrors -gt $MaxRetries) {
+                    Write-Log error retries_exhausted ([ordered]@{ operation = 'alert_resolve'; batch_size = $limit; retries = $MaxRetries; filter = $HashFilterKey })
+                    Write-ErrorLine "Server error (HTTP 500) resolving STAR alerts persisted after $MaxRetries retries (limit reduced to $limit): $($_.Exception.Message)"
+                    $script:FailedChunks++
+                    break
+                }
+                if (-not $retriedSameSize) {
+                    # A 500 may be transient, so the first retry keeps the limit; only a second consecutive 500 shrinks it.
+                    $retriedSameSize = $true
+                    Write-Log warn retry_same_size ([ordered]@{ operation = 'alert_resolve'; batch_size = $limit; retry = $serverErrors; max_retries = $MaxRetries; filter = $HashFilterKey })
+                    Write-Warning "Server error (HTTP 500) resolving STAR alerts; retrying at the same limit $limit (retry $serverErrors/$MaxRetries)."
+                }
+                else {
+                    $previousLimit = $limit
+                    $limit = [math]::Max(1, $limit - $BatchReductionStep)
+                    Write-Log warn batch_size_reduced ([ordered]@{ operation = 'alert_resolve'; from = $previousLimit; to = $limit; retry = $serverErrors; max_retries = $MaxRetries; filter = $HashFilterKey })
+                    Write-Warning "Server error (HTTP 500) resolving STAR alerts; retrying with limit $limit (retry $serverErrors/$MaxRetries)."
+                }
+                Start-Sleep -Seconds $BatchDelaySeconds
+                $batch--
+                continue
+            }
+            Write-ErrorLine "Error resolving STAR alerts: $($_.Exception.Message)"
             $script:FailedChunks++
             break
         }
 
+        $serverErrors = 0
+        $retriedSameSize = $false
         $affected = Get-AffectedCount $response
         Write-Host "[+] Alerts batch #$batch affected: $affected"
 
         $script:AlertsResolved += $affected
         $groupAlertsResolved += $affected
 
-        if ($affected -lt $AlertsBatchLimit -or $affected -eq 0) {
+        if ($affected -lt $limit -or $affected -eq 0) {
             break
         }
 
@@ -497,9 +834,28 @@ function Resolve-CloudDetectionAlertsByHashes {
 
 # ===================== MAIN ============================
 
+Write-Log info run_start ([ordered]@{
+        server                = ([uri]$Server).Host
+        token                 = $MaskedToken
+        hash_count            = $FileHash.Count
+        hashes                = ($FileHash -join ',')
+        threat_verdict        = $ThreatAnalystVerdict
+        alert_verdict         = $AlertAnalystVerdict
+        threats_page_size     = $ThreatsPageSize
+        threats_batch_limit   = $ThreatsBatchLimit
+        alerts_batch_limit    = $AlertsBatchLimit
+        batch_delay_seconds   = $BatchDelaySeconds
+        max_retries           = $MaxRetries
+        powershell            = $PSVersionTable.PSVersion.ToString()
+        os                    = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+        log_file              = $script:LogFile
+    })
+
 Write-Host "=== SentinelOne hash workflow: $($FileHash.Count) hash(es) ===" -ForegroundColor Yellow
 Write-Host "Console: $Server"
+Write-Host "Log:     $($script:LogFile) (run_id $($script:RunId))"
 $script:ConsoleRelease = Get-ConsoleRelease
+Write-Log info console_release ([ordered]@{ release = $(if ($script:ConsoleRelease) { $script:ConsoleRelease } else { 'unknown' }) })
 if ($script:ConsoleRelease) {
     Write-Host "Console release: $($script:ConsoleRelease)"
 }
@@ -516,26 +872,31 @@ try {
         $script:ThreatsFound = Export-ThreatIdsByHashes -Hashes $FileHash -SpoolPath $spoolPath
     }
     catch {
-        Write-Error "Threat lookup failed: $($_.Exception.Message)" -ErrorAction Continue
+        Write-ErrorLine "Threat lookup failed: $($_.Exception.Message)"
+        Write-Log error lookup_failed ([ordered]@{ error = [string]$_.Exception.Message })
         $script:LookupFailed = $true
     }
 
     if (-not $script:LookupFailed) {
         Write-Host "[=] Found $($script:ThreatsFound) unresolved threats across $($FileHash.Count) hash(es)" -ForegroundColor Green
+        $completeFields = [ordered]@{ threats_found = $script:ThreatsFound; api_total_items = $script:LookupStats.ApiTotalItems; hash_count = $FileHash.Count }
+        Add-StatusFields -Fields $completeFields -Incident $script:LookupStats.Incident -Mitigation $script:LookupStats.Mitigation
+        Write-Log info lookup_complete $completeFields
 
         if ($script:ThreatsFound -eq 0) {
             Write-Host "[=] No threats to resolve, skipping threats step." -ForegroundColor Yellow
         }
         else {
-            # BIG RED PROMPT: ASK ABOUT UNQUARANTINE (once, for all hashes together)
-            Write-Host "**********************************************************************" -ForegroundColor Red
-            Write-Host "YOU ARE ABOUT TO RESOLVE $($script:ThreatsFound) THREATS & ALERTS FOR $($FileHash.Count) HASH(ES): $($FileHash -join ', ')" -ForegroundColor Red
-            Write-Host "Optionally, you can also UNQUARANTINE any files associated with these" -ForegroundColor Red
-            Write-Host "hashes BEFORE resolving the incidents (equivalent to Threats > Unquarantine)." -ForegroundColor Red
-            Write-Host "**********************************************************************" -ForegroundColor Red
+            # BIG YELLOW PROMPT (black on yellow, like a caution sign: stands out without implying an error): ASK ABOUT UNQUARANTINE (once, for all hashes together)
+            Write-Host "**********************************************************************" -ForegroundColor Black -BackgroundColor Yellow
+            Write-Host "YOU ARE ABOUT TO RESOLVE $($script:ThreatsFound) THREATS & ALERTS FOR $($FileHash.Count) HASH(ES): $($FileHash -join ', ')" -ForegroundColor Black -BackgroundColor Yellow
+            Write-Host "Optionally, you can also UNQUARANTINE any files associated with these" -ForegroundColor Black -BackgroundColor Yellow
+            Write-Host "hashes BEFORE resolving the incidents (equivalent to Threats > Unquarantine)." -ForegroundColor Black -BackgroundColor Yellow
+            Write-Host "**********************************************************************" -ForegroundColor Black -BackgroundColor Yellow
 
             $unqChoice = Read-Host "Do you want to send UNQUARANTINE commands for these hashes first? (Y/N)"
             $unquarantine = $unqChoice -match '^(Y|y)$'
+            Write-Log info operator_choice ([ordered]@{ unquarantine = [bool]$unquarantine })
 
             Write-Host ""
             if ($unquarantine) {
@@ -545,16 +906,7 @@ try {
                 Write-Host ">>> Skipping unquarantine. Proceeding directly to resolve incidents..." -ForegroundColor Yellow
             }
 
-            $chunkCount = [int][math]::Ceiling($script:ThreatsFound / $ThreatsBatchLimit)
-            $script:chunkNumber = 0
-            Invoke-ForEachIdChunk -SpoolPath $spoolPath -ChunkSize $ThreatsBatchLimit -Action {
-                param([string[]]$Ids)
-                $script:chunkNumber++
-                Send-ThreatIdChunk -Ids $Ids -ChunkNumber $script:chunkNumber -ChunkCount $chunkCount -Unquarantine $unquarantine
-                if ($script:chunkNumber -lt $chunkCount) {
-                    Start-Sleep -Seconds $BatchDelaySeconds
-                }
-            }
+            Resolve-ThreatIdsFromSpool -SpoolPath $spoolPath -Unquarantine $unquarantine
 
             Write-Host "[=] Total threat incidents resolved: $($script:ThreatsResolved)" -ForegroundColor Green
         }
@@ -579,6 +931,9 @@ Write-Host "Threats unquarantined:  $($script:ThreatsUnquarantined)"
 Write-Host "Threats resolved:       $($script:ThreatsResolved)"
 Write-Host "Alerts resolved:        $($script:AlertsResolved)"
 Write-Host "Failed chunks:          $($script:FailedChunks)"
+if ($script:ThreatsUnprocessed -gt 0) {
+    Write-Host "Threat ids NOT resolved: $($script:ThreatsUnprocessed) (still unresolved; re-run to pick them up)" -ForegroundColor Red
+}
 if ($script:LookupFailed) {
     Write-Host "Threat lookup:          FAILED" -ForegroundColor Red
 }
@@ -589,7 +944,16 @@ if ($script:ThreatsFound -eq 0 -and $script:AlertsResolved -eq 0 -and -not $scri
 Write-Host ""
 Write-Host "=== Done ===" -ForegroundColor Yellow
 
-if ($script:LookupFailed -or $script:FailedChunks -gt 0) {
-    exit 1
-}
-exit 0
+$exitCode = if ($script:LookupFailed -or $script:FailedChunks -gt 0) { 1 } else { 0 }
+Write-Log $(if ($exitCode -eq 0) { 'info' } else { 'error' }) run_end ([ordered]@{
+        exit_code            = $exitCode
+        duration_s           = [math]::Round($script:RunTimer.Elapsed.TotalSeconds, 1)
+        threats_found        = $script:ThreatsFound
+        threats_unquarantined = $script:ThreatsUnquarantined
+        threats_resolved     = $script:ThreatsResolved
+        threats_unprocessed  = $script:ThreatsUnprocessed
+        alerts_resolved      = $script:AlertsResolved
+        failed_chunks        = $script:FailedChunks
+        lookup_failed        = $script:LookupFailed
+    })
+exit $exitCode
