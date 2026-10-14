@@ -24,6 +24,33 @@ Several hashes are handled together as one batch (one lookup, one un-quarantine 
 
 Run it from a PowerShell session, or from a shell with `pwsh -Command "./alert-storm-mssp.ps1 ... -FileHash <hash1>,<hash2>"`. `pwsh -File` hands the list over as a single string, which fails validation.
 
+## Creating the role
+
+`create-role.ps1` creates a custom role with the permissions below, plus the permissions they depend on (View on Endpoint Threats and on STAR Rule Alerts; the console answers HTTP 403 on the update calls without them). The API has no standalone permission catalog, so it reads the numeric permission ids from an existing role in the same scope (`-TemplateRoleId`, which isn't changed), creates the new role in an account, site or group, and then checks that every permission is granted on it.
+
+```powershell
+$token = Read-Host -AsSecureString -Prompt 'API token'
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId <site id> -TemplateRoleId <role id>
+```
+
+The token's user needs `Roles.create` (and permission to view the template role). Use `-SkipUnquarantine` to leave out un-quarantine, `-IncludeTemplatePermissions` to also copy everything the template grants, and `-RoleName` / `-RoleDescription` to name it. Assign the new role to the API user afterwards. Logs go to `./create-role.log`.
+
+## Required permissions
+
+The API token's user needs these RBAC permissions (API permission names from the console swagger, S-26.3.4), scoped to every account, site or group whose threats and alerts should be resolved. The script doesn't check permissions up front; a missing one shows up as a failed call in the log, or, for un-quarantine, as `affected=0`.
+
+| Step | Endpoint | Permission |
+|---|---|---|
+| Look up threats | `GET /threats` | `Threats.view` |
+| Resolve threats | `POST /threats/incident` | `Threats.updateIncidentStatus` |
+| Apply the threat verdict | `POST /threats/incident` | `Threats.updateAnalystVerdict` |
+| Un-quarantine (only if you answer Y) | `POST /threats/mitigate/un-quarantine` | `Threats.unquarantine`, and a role allowed to mitigate (Admin, IR Team or SOC) |
+| Resolve alerts | `POST /cloud-detection/alerts/incident` | `Custom Alerts.updateIncidentStatus` |
+| Apply the alert verdict | `POST /cloud-detection/alerts/analyst-verdict` | `Custom Alerts.updateAnalystVerdict` |
+| Console release (optional) | `GET /system/info` | none listed; a failure only logs the release as `unknown` |
+
+Un-quarantine only counts threats you're permitted to mitigate as `affected`, so `affected=0` on every `threat_unquarantine` call means either nothing was quarantined or the token lacks permission.
+
 ## Logging
 
 Every run appends structured logs to `-LogPath` (default `./alert-storm-mssp.log`), one [logfmt](https://brandur.org/logfmt) line per event, the same `key=value` shape as structlog's key-value renderer. Each line has `ts` (UTC), `level`, `run_id` and `event`. The run stops before any API call if the file can't be written. The log holds the console host name, endpoint paths, the hashes and a masked token (`first10*****last10`, or `*****` for a short one). It never holds the full token or URLs.

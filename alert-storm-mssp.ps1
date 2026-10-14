@@ -46,6 +46,17 @@ Retries when the console answers HTTP 429 (rate limited) or HTTP 500 (server err
 .PARAMETER LogPath
 File that structured logs are appended to, one logfmt line per event (key=value pairs, UTC timestamps), tagged with a run_id so many runs can share one file. Every API attempt is logged with its operation, requested batch size, outcome (ok, rate_limited, server_error, error), duration and item count, which is enough to work out which batch sizes succeed most often. The log never contains the token (only a masked form) or full URLs. Default: ./alert-storm-mssp.log (relative to the current directory). The run stops before any API call if the file cannot be written.
 
+.NOTES
+Required RBAC permissions for the API token's user (names are the API permission identifiers from the management console swagger, S-26.3.4). The script does not check them up front. Scope them to every account/site/group whose threats and alerts should be resolved.
+  Threats.view                          GET  /threats (threat lookup)
+  Threats.updateIncidentStatus          POST /threats/incident (resolve threats)
+  Threats.updateAnalystVerdict          POST /threats/incident (apply -ThreatAnalystVerdict)
+  Threats.unquarantine                  POST /threats/mitigate/un-quarantine (only if you answer Y to the prompt; the role must also be allowed to mitigate: Admin, IR Team or SOC)
+  Custom Alerts.updateIncidentStatus    POST /cloud-detection/alerts/incident (resolve STAR alerts)
+  Custom Alerts.updateAnalystVerdict    POST /cloud-detection/alerts/analyst-verdict (apply -AlertAnalystVerdict)
+GET /system/info (console release) lists no permission requirement; if it fails the run continues with the release logged as unknown.
+The un-quarantine endpoint only counts threats you are permitted to mitigate as affected, so affected=0 on every threat_unquarantine call can mean missing permission as well as nothing being quarantined.
+
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
 ./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1-or-sha256>
@@ -196,7 +207,7 @@ function Write-Log {
     param(
         [ValidateSet('info', 'warn', 'error')]
         [string]$Level,
-        [string]$Event,
+        [string]$EventName,
         [System.Collections.IDictionary]$Fields
     )
 
@@ -208,7 +219,7 @@ function Write-Log {
     $parts.Add('ts=' + [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))
     $parts.Add("level=$Level")
     $parts.Add("run_id=$($script:RunId)")
-    $parts.Add('event=' + (ConvertTo-LogfmtValue $Event))
+    $parts.Add('event=' + (ConvertTo-LogfmtValue $EventName))
     if ($Fields) {
         foreach ($key in $Fields.Keys) {
             $parts.Add("$key=" + (ConvertTo-LogfmtValue $Fields[$key]))

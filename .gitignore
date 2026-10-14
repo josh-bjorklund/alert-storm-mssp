@@ -2,3 +2,4 @@ docs/threat_result_example.json
 docs/spec-params-and-threat-lookup.md
 docs/swagger*.json
 alert-storm-mssp.log
+create-role.log
