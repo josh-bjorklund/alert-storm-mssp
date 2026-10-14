@@ -1,72 +1,58 @@
 <#
 .SYNOPSIS
-Detection and alert resolver v2.1 - Josh Bjorklund
-
-MSSP edition - No site IDs needed.
+Detection and alert resolver v2.1 - Josh Bjorklund (MSSP edition: no site IDs needed).
 
 .DESCRIPTION
-Optionally unquarantines any threats for the given hash(es) (if the user confirms), then resolves both threats and STAR alerts for all of them.
+Resolves the threats and STAR alerts for one or more file hashes, optionally un-quarantining the threats first. All hashes are handled as one batch, with one un-quarantine prompt.
 
-All hashes are looked up and remediated together, not one at a time: a single GET /threats call (contentHashes accepts a list) finds every matching threat across all hashes, the user is prompted once for unquarantine, and the resulting threat ids are resolved as one batch. STAR alerts are resolved per hash algorithm (SHA1 vs SHA256, since that's what the alerts filter field is keyed on) in at most two batched calls covering every hash of that type, rather than one call per hash.
+Threats are looked up with GET /threats and only their ids are sent to the un-quarantine and resolve endpoints, which works around /threats/incident ignoring its limit. The ids are spooled to a temporary file, so memory stays flat. STAR alerts are resolved per hash type (SHA1 or SHA256). HTTP 429 and 500 responses are retried (500 with smaller batches).
 
-Threats are first looked up with GET /threats (all filters live there). Only the resulting threat ids are sent to the un-quarantine and incident endpoints, which works around /threats/incident not passing its limit to its internal query. Ids are spooled to a temporary file so memory use stays flat for very large hashes.
-
-Exit code: 0 on success (including "nothing matched"), 1 if any chunk or lookup failed.
+Exit code: 0 on success (including nothing matched), 1 if any chunk or the lookup failed.
 
 .PARAMETER Server
-Management console base URL, e.g. https://usea1-123.sentinelone.net (a trailing slash is trimmed).
+Console base URL, e.g. https://usea1-123.sentinelone.net.
 
 .PARAMETER ApiToken
 API token, as a SecureString.
 
 .PARAMETER FileHash
-One or more SHA1 (40 hex) or SHA256 (64 hex) hashes of the files to resolve threats and alerts for. Pass them as a PowerShell array, e.g. -FileHash hash1,hash2 (no quotes around the whole list), or a variable holding an array. This needs a PowerShell session or pwsh -Command; pwsh -File delivers "hash1,hash2" as a single string, which fails validation. Hashes are lowercased and duplicates are ignored. All hashes are looked up and remediated together as a single batch, not one at a time.
+One or more SHA1 or SHA256 hashes. Pass an array (-FileHash hash1,hash2); pwsh -File can't. Hashes are lowercased and deduplicated.
 
 .PARAMETER ThreatAnalystVerdict
-Analyst verdict applied when resolving threats. Default: false_positive.
+Verdict applied to resolved threats: undefined, true_positive, false_positive or suspicious. Default: false_positive.
 
 .PARAMETER AlertAnalystVerdict
-Analyst verdict applied when resolving STAR alerts. Default: false_positive.
+Verdict applied to resolved STAR alerts (same values). Default: false_positive.
 
 .PARAMETER ThreatsPageSize
-Page size for the GET /threats lookup (1-1000). Default: 1000.
+Page size of the threat lookup (1-1000). Default: 1000.
 
 .PARAMETER ThreatsBatchLimit
-Number of threat ids sent per un-quarantine / resolve call (1-5000). Default: 5000.
+Threat ids per un-quarantine/resolve call (1-5000). Default: 5000.
 
 .PARAMETER AlertsBatchLimit
-Per-call limit for STAR alert calls. Default: 500.
+Alerts per call (1-5000). Default: 500.
 
 .PARAMETER BatchDelaySeconds
-Delay between batches, to be gentle with rate limits (0-3600). Default: 1.
+Pause between batches (0-3600). Default: 1.
 
 .PARAMETER MaxRetries
-Retries when the console answers HTTP 429 (rate limited) or HTTP 500 (server error), 0-10. On 429 it waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). On 500 it retries the same work: the first retry keeps the batch size (a 500 is often transient), and each further consecutive 500 reduces the batch size (lookup page size, ids per un-quarantine/resolve call, or alerts per call) by a step that doubles each time (100, then 200, 400, 800, ...; never below 1), so no threat is skipped. The 500 retry count and the step reset after any successful call; the reduced size is kept for the rest of that step. Default: 5.
+Retries on HTTP 429 (waits for Retry-After, else backs off) and HTTP 500 (the first retry keeps the batch size, later ones shrink it), 0-10. Default: 5.
 
 .PARAMETER LogPath
-File that structured logs are appended to, one logfmt line per event (key=value pairs, UTC timestamps), tagged with a run_id so many runs can share one file. Every API attempt is logged with its operation, requested batch size, outcome (ok, rate_limited, server_error, error), duration and item count, which is enough to work out which batch sizes succeed most often. The log never contains the token (only a masked form) or full URLs. Default: ./alert-storm-mssp.log (relative to the current directory). The run stops before any API call if the file cannot be written.
+Structured (logfmt) log, appended and tagged with a run_id; the token is masked. Default: ./alert-storm-mssp.log. The run stops if it can't be written.
 
 .NOTES
-Required RBAC permissions for the API token's user (names are the API permission identifiers from the management console swagger, S-26.3.4). The script does not check them up front. Scope them to every account/site/group whose threats and alerts should be resolved.
-  Threats.view                          GET  /threats (threat lookup)
-  Threats.updateIncidentStatus          POST /threats/incident (resolve threats)
-  Threats.updateAnalystVerdict          POST /threats/incident (apply -ThreatAnalystVerdict)
-  Threats.unquarantine                  POST /threats/mitigate/un-quarantine (only if you answer Y to the prompt; the role must also be allowed to mitigate: Admin, IR Team or SOC)
-  Custom Alerts.updateIncidentStatus    POST /cloud-detection/alerts/incident (resolve STAR alerts)
-  Custom Alerts.updateAnalystVerdict    POST /cloud-detection/alerts/analyst-verdict (apply -AlertAnalystVerdict)
-GET /system/info (console release) lists no permission requirement; if it fails the run continues with the release logged as unknown.
-The un-quarantine endpoint only counts threats you are permitted to mitigate as affected, so affected=0 on every threat_unquarantine call can mean missing permission as well as nothing being quarantined.
+Required RBAC permissions: see "Required permissions" in README.md. create-role.ps1 creates a role with them.
 
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
 ./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1-or-sha256>
 
 .EXAMPLE
-$token = Read-Host -AsSecureString -Prompt 'API token'
 ./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <hash1>,<hash2>,<hash3>
 
 .EXAMPLE
-# From a shell, use -Command (pwsh -File cannot pass an array).
 pwsh -Command "./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -FileHash <hash1>,<hash2>"
 #>
 

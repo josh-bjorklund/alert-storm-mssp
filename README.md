@@ -24,46 +24,110 @@ Several hashes are handled together as one batch (one lookup, one un-quarantine 
 
 Run it from a PowerShell session, or from a shell with `pwsh -Command "./alert-storm-mssp.ps1 ... -FileHash <hash1>,<hash2>"`. `pwsh -File` hands the list over as a single string, which fails validation.
 
-## Creating the role
+## Examples
 
-`create-role.ps1` creates a custom role with the permissions below, which is the smallest set the scripts need. The API has no standalone permission catalog, so it reads the numeric permission ids from an existing role in the same scope (`-TemplateRoleId`, which isn't changed), creates the new role in an account, site or group, and then checks that every permission is granted on it.
+Most runs only need `-Server`, `-ApiToken` and `-FileHash`. Everything else has a default and is only for tuning.
+
+Store the token once per session; the examples below use `$token`:
 
 ```powershell
 $token = Read-Host -AsSecureString -Prompt 'API token'
-./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId <site id> -TemplateRoleId <role id>
 ```
 
-The token's user needs `Roles.create` (and permission to view the template role). Use `-SkipUnquarantine` to leave out un-quarantine, `-IncludeTemplatePermissions` to also copy everything the template grants, and `-RoleName` / `-RoleDescription` to name it. Assign the new role to the API user afterwards. Logs go to `./create-role.log`.
+**1. Typical run.** Uses the defaults: `false_positive` for threats and alerts, and 5000-id chunks.
 
-### The new role grants 7 permissions
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha256>
+```
 
-To create the role by hand in the console, grant exactly these permissions (page and permission names as the console's role editor shows them) and nothing else:
+**2. Several hashes.** One lookup, one un-quarantine prompt, resolved as one batch. SHA1 and SHA256 can be mixed.
 
-| Console page | Permission | Needed for (API permission name) |
-|---|---|---|
-| Endpoint Threats | View | `Threats.view` |
-| Endpoint Threats | Update Incident Status | `Threats.updateIncidentStatus` |
-| Endpoint Threats | Update Analyst Verdict | `Threats.updateAnalystVerdict` |
-| Endpoint Threats | Unquarantine | `Threats.unquarantine` (only if you answer Y to the un-quarantine prompt) |
-| STAR Rule Alerts | View | `Custom Alerts.view` |
-| STAR Rule Alerts | Update Incident Status | `Custom Alerts.updateIncidentStatus` |
-| STAR Rule Alerts | Update Analyst Verdict | `Custom Alerts.updateAnalystVerdict` |
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha1>,<sha256>,<sha256>
+```
 
-Both `View` permissions are listed because the role definition records each page's `View` as a dependency of that page's update permissions. A missing one is the likely cause of a 403 on the update calls. With `-SkipUnquarantine` the role grants 6 permissions.
+**3. Different verdicts.** The values are `undefined`, `true_positive`, `false_positive` and `suspicious`.
+
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha256> `
+    -ThreatAnalystVerdict suspicious -AlertAnalystVerdict true_positive
+```
+
+**4. Gentler on a slow console.** Smaller chunks, longer pauses and more retries.
+
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha256> `
+    -ThreatsBatchLimit 2000 -ThreatsPageSize 500 -AlertsBatchLimit 200 -BatchDelaySeconds 5 -MaxRetries 8
+```
+
+**5. One log per case.** Makes runs easy to compare later.
+
+```powershell
+./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -FileHash <sha256> `
+    -LogPath ./logs/case-12345.log
+```
+
+From a shell, `pwsh -File` can't pass a list of hashes. Use `-Command` with an array; the script prompts for the token:
+
+```bash
+pwsh -Command "./alert-storm-mssp.ps1 -Server https://usea1-123.sentinelone.net -FileHash @('<sha1>','<sha256>')"
+```
+
+When to change the tuning parameters: check `alert-storm-mssp.log` after a run.
+- `outcome=server_error` (HTTP 500) on `threat_resolve`: try a smaller `-ThreatsBatchLimit`.
+- `outcome=rate_limited` (HTTP 429): raise `-BatchDelaySeconds` or `-MaxRetries`.
+- Slow lookups: leave `-ThreatsPageSize` at 1000 (its maximum) unless the lookup itself returns 500s.
+
+The values in example 4 are illustrative, not tested recommendations.
+
+## Creating the role
+
+`create-role.ps1` creates a custom role with the permissions listed under [Required permissions](#required-permissions), which is the smallest set the scripts need. It is intended to be run by an administrative user (one allowed to create roles), not by the API user that runs `alert-storm-mssp.ps1`; that user only needs the role it creates. The API has no standalone permission catalog, so it reads the numeric permission ids from the predefined Viewer role (found with `GET /rbac/roles?name=Viewer&predefinedRole=true` and not changed), creates the new role (at the global level by default, or in an account, site or group), and then checks that every permission is granted on it.
+
+Store the token once per session; the examples below use `$token`:
+
+```powershell
+$token = Read-Host -AsSecureString -Prompt 'API token'
+```
+
+**1. Site scope.** The role can only be assigned within that site, which is the narrower choice for least privilege.
+
+```powershell
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId <site id>
+```
+
+**2. Global scope.** Above accounts and sites; this is the default when no scope is given.
+
+```powershell
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token
+```
+
+**3. Account scope, custom name, without un-quarantine.** The role grants 6 permissions.
+
+```powershell
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -AccountId <account id> `
+    -RoleName alert-storm-mssp-no-unquarantine -SkipUnquarantine
+```
+
+Run it with an administrative user's token: that user needs `Roles.create` (and permission to view roles). If the Viewer lookup fails, or you want a different role as the template, pass `-TemplateRoleId <role id>`. With no scope option the role is created at the global level (the API's tenant scope, where the predefined Viewer role lives), above any account or site, so it can be assigned anywhere. That's the widest scope, so prefer a narrower one for least privilege: pass one of `-AccountId`, `-SiteId` or `-GroupId` (at most one scope option; `-Global` just states the default explicitly). Use `-SkipUnquarantine` to leave out un-quarantine, `-IncludeTemplatePermissions` to also copy everything the template grants, and `-RoleName` / `-RoleDescription` to name it. Assign the new role to the API user afterwards. Logs go to `./create-role.log`.
 
 ## Required permissions
 
-The API token's user needs these RBAC permissions (API permission names from the console swagger, S-26.3.4), scoped to every account, site or group whose threats and alerts should be resolved. The script doesn't check permissions up front; a missing one shows up as a failed call in the log, or, for un-quarantine, as `affected=0`.
+The API token's user needs these 7 RBAC permissions (API permission names from the console swagger, S-26.3.4), scoped to every account, site or group whose threats and alerts should be resolved. [`create-role.ps1`](#creating-the-role) creates a role with exactly these. To create it by hand in the console, grant these (page and permission names as the console's role editor shows them) and nothing else. The script doesn't check permissions up front; a missing one shows up as a failed call in the log, or, for un-quarantine, as `affected=0`.
 
-| Step | Endpoint | Permission |
-|---|---|---|
-| Look up threats | `GET /threats` | `Threats.view` |
-| Resolve threats | `POST /threats/incident` | `Threats.updateIncidentStatus` |
-| Apply the threat verdict | `POST /threats/incident` | `Threats.updateAnalystVerdict` |
-| Un-quarantine (only if you answer Y) | `POST /threats/mitigate/un-quarantine` | `Threats.unquarantine`, and a role allowed to mitigate (Admin, IR Team or SOC) |
-| Resolve alerts | `POST /cloud-detection/alerts/incident` | `Custom Alerts.updateIncidentStatus` |
-| Apply the alert verdict | `POST /cloud-detection/alerts/analyst-verdict` | `Custom Alerts.updateAnalystVerdict` |
-| Console release (optional) | `GET /system/info` | none listed; a failure only logs the release as `unknown` |
+| Console page | Permission | API permission name | Used for |
+|---|---|---|---|
+| Endpoint Threats | View | `Threats.view` | Look up threats (`GET /threats`); also a dependency of the Endpoint Threats update permissions |
+| Endpoint Threats | Update Incident Status | `Threats.updateIncidentStatus` | Resolve threats (`POST /threats/incident`) |
+| Endpoint Threats | Update Analyst Verdict | `Threats.updateAnalystVerdict` | Apply the threat verdict (`POST /threats/incident`) |
+| Endpoint Threats | Unquarantine | `Threats.unquarantine` | Un-quarantine (`POST /threats/mitigate/un-quarantine`), only if you answer Y; the swagger also says the user's role must be allowed to mitigate (Admin, IR Team or SOC) |
+| STAR Rule Alerts | View | `Custom Alerts.view` | Dependency of the STAR Rule Alerts update permissions |
+| STAR Rule Alerts | Update Incident Status | `Custom Alerts.updateIncidentStatus` | Resolve alerts (`POST /cloud-detection/alerts/incident`) |
+| STAR Rule Alerts | Update Analyst Verdict | `Custom Alerts.updateAnalystVerdict` | Apply the alert verdict (`POST /cloud-detection/alerts/analyst-verdict`) |
+
+Both `View` permissions are listed because the role definition records each page's `View` as a dependency of that page's update permissions. A missing one is the likely cause of a 403 on the update calls. Without un-quarantine (`-SkipUnquarantine` in `create-role.ps1`) the role grants 6 permissions.
+
+`GET /system/info` (the console release) lists no permission; a failure only logs the release as `unknown`.
 
 Un-quarantine only counts threats you're permitted to mitigate as `affected`, so `affected=0` on every `threat_unquarantine` call means either nothing was quarantined or the token lacks permission.
 

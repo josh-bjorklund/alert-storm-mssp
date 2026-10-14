@@ -47,6 +47,7 @@ Describe 'create-role.ps1' {
         $global:Cr.Calls = [System.Collections.Generic.List[object]]::new()
         $global:Cr.Template = New-CrTemplate
         $global:Cr.Existing = @()
+        $global:Cr.ViewerRoles = @([pscustomobject]@{ id = '111'; name = 'Viewer' })   # answer to GET /rbac/roles?name=Viewer&predefinedRole=true
         $global:Cr.Answer = 'Y'
         $global:Cr.NotGranted = @()          # ids the verify step reports as not granted
         $global:Cr.PostError = $null         # message the server returns with a 400 on create
@@ -79,6 +80,7 @@ Describe 'create-role.ps1' {
                 return [pscustomobject]@{ data = [pscustomobject]@{ id = '999' } }
             }
             if ($method -eq 'GET' -and $path -eq '/web/api/v2.1/rbac/roles') {
+                if ($query['predefinedRole'] -eq 'true') { return [pscustomobject]@{ data = @($global:Cr.ViewerRoles) } }
                 return [pscustomobject]@{ data = @($global:Cr.Existing) }
             }
             if ($method -eq 'GET' -and $path -eq '/web/api/v2.1/rbac/role/111') {
@@ -127,11 +129,8 @@ Describe 'create-role.ps1' {
         It 'rejects a non-https server' {
             { Invoke-Script @{ Server = 'http://example.sentinelone.net' } } | Should -Throw
         }
-        It 'requires a scope' {
-            { Invoke-Script @{ SiteId = $null } } | Should -Throw '*exactly one*'
-        }
         It 'rejects more than one scope' {
-            { Invoke-Script @{ AccountId = '7' } } | Should -Throw '*exactly one*'
+            { Invoke-Script @{ AccountId = '7' } } | Should -Throw '*only one*'
         }
         It 'rejects a non-numeric template role id' {
             { Invoke-Script @{ TemplateRoleId = 'abc' } } | Should -Throw
@@ -143,7 +142,7 @@ Describe 'create-role.ps1' {
             { Invoke-Script @{ MaxRetries = 11 } } | Should -Throw
         }
         It 'makes no API call when validation fails' {
-            { Invoke-Script @{ SiteId = $null } } | Should -Throw
+            { Invoke-Script @{ AccountId = '7' } } | Should -Throw
             $global:Cr.Calls.Count | Should -Be 0
         }
     }
@@ -196,6 +195,100 @@ Describe 'create-role.ps1' {
             $text = $global:Cr.Output | Out-String
             $text | Should -Match 'Created role .alert-storm-mssp. \(id 999\)'
             $text | Should -Match 'Verified: all 8 permissions'
+        }
+    }
+
+    Context 'global (tenant) scope' {
+        It 'creates the role at the tenant scope with -Global' {
+            Invoke-Script @{ SiteId = $null; Global = $true } | Should -Be 0
+            $b = (Get-Calls '^POST .*/rbac/role$')[0].Body
+            @($b.filter.PSObject.Properties.Name) | Should -Be @('tenant')
+            $b.filter.tenant | Should -BeTrue
+            ($global:Cr.Output | Out-String) | Should -Match 'Scope:\s+global \(tenant\)'
+        }
+        It 'reads the template, checks for duplicates and verifies at the tenant scope' {
+            Invoke-Script @{ SiteId = $null; Global = $true } | Should -Be 0
+            (Get-Calls '^GET .*/rbac/role/111\?tenant=true$').Count | Should -Be 1
+            (Get-Calls '^GET .*/rbac/roles\?name=alert-storm-mssp&tenant=true').Count | Should -Be 1
+            (Get-Calls '^GET .*/rbac/role/999\?tenant=true$').Count | Should -Be 1
+        }
+        It 'still looks up Viewer, without a scope filter' {
+            Invoke-Script @{ SiteId = $null; Global = $true; TemplateRoleId = $null } | Should -Be 0
+            (Get-Calls '^GET .*/rbac/roles\?name=Viewer&predefinedRole=true$').Count | Should -Be 1
+        }
+        It 'grants the same permissions as at any other scope' {
+            Invoke-Script @{ SiteId = $null; Global = $true } | Should -Be 0
+            @((Get-Calls '^POST .*/rbac/role$')[0].Body.data.permissionIds | Sort-Object) | Should -Be @('101', '103', '104', '105', '107', '201', '202', '203')
+        }
+        It 'defaults to the global scope when no scope option is given' {
+            Invoke-Script @{ SiteId = $null } | Should -Be 0
+            $b = (Get-Calls '^POST .*/rbac/role$')[0].Body
+            @($b.filter.PSObject.Properties.Name) | Should -Be @('tenant')
+            $b.filter.tenant | Should -BeTrue
+            (Get-Calls '^GET .*/rbac/role/111\?tenant=true$').Count | Should -Be 1
+            ($global:Cr.Output | Out-String) | Should -Match 'Scope:\s+global \(tenant\) \[default\]'
+        }
+        It 'does not mark an explicit -Global as defaulted' {
+            Invoke-Script @{ SiteId = $null; Global = $true } | Should -Be 0
+            ($global:Cr.Output | Out-String) | Should -Not -Match '\[default\]'
+            $events = @(Get-Content -LiteralPath $global:Cr.LogPath | ForEach-Object { ConvertFrom-Logfmt $_ })
+            @($events | Where-Object event -eq 'run_start')[0].scope_default | Should -Be 'false'
+        }
+        It 'still uses the given scope instead of the default' {
+            Invoke-Script @{ GroupId = '9'; SiteId = $null } | Should -Be 0
+            @((Get-Calls '^POST .*/rbac/role$')[0].Body.filter.PSObject.Properties.Name) | Should -Be @('groupIds')
+            ($global:Cr.Output | Out-String) | Should -Not -Match '\[default\]'
+        }
+        It 'rejects -Global together with another scope' {
+            { Invoke-Script @{ Global = $true } } | Should -Throw '*only one*'
+            $global:Cr.Calls.Count | Should -Be 0
+        }
+        It 'logs the tenant scope' {
+            Invoke-Script @{ SiteId = $null; Global = $true } | Should -Be 0
+            $events = @(Get-Content -LiteralPath $global:Cr.LogPath | ForEach-Object { ConvertFrom-Logfmt $_ })
+            @($events | Where-Object event -eq 'run_start')[0].scope | Should -Be 'tenant'
+        }
+    }
+
+    Context 'template role lookup' {
+        It 'looks up the predefined Viewer role and reads its permissions when no template id is given' {
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 0
+            $lookup = Get-Calls '^GET .*/rbac/roles\?name=Viewer&predefinedRole=true$'
+            $lookup.Count | Should -Be 1
+            (Get-Calls '^GET .*/rbac/role/111').Count | Should -Be 1
+            (Get-Calls '^POST .*/rbac/role$').Count | Should -Be 1
+            ($global:Cr.Output | Out-String) | Should -Match 'Template role: predefined Viewer \(id 111\)'
+        }
+        It 'does not look up Viewer when -TemplateRoleId is given' {
+            Invoke-Script | Should -Be 0
+            (Get-Calls 'predefinedRole=true').Count | Should -Be 0
+        }
+        It 'uses whichever id the lookup returns' {
+            $global:Cr.ViewerRoles = @([pscustomobject]@{ id = '111'; name = 'Viewer' })
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 0
+            @(Get-Calls '^GET .*/rbac/role/\d+')[0].Uri | Should -Match '/rbac/role/111'
+        }
+        It 'ignores a similarly named role in the lookup result' {
+            $global:Cr.ViewerRoles = @([pscustomobject]@{ id = '999999'; name = 'Viewer Plus' }, [pscustomobject]@{ id = '111'; name = 'Viewer' })
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 0
+            @(Get-Calls '^GET .*/rbac/role/\d+')[0].Uri | Should -Match '/rbac/role/111'
+        }
+        It 'fails, pointing at -TemplateRoleId, when no Viewer role is found' {
+            $global:Cr.ViewerRoles = @()
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 1
+            (Get-Calls '^POST ').Count | Should -Be 0
+            ($global:Cr.Output | Out-String) | Should -Match 'Pass -TemplateRoleId'
+        }
+        It 'fails, listing the ids, when more than one Viewer role is found' {
+            $global:Cr.ViewerRoles = @([pscustomobject]@{ id = '111'; name = 'Viewer' }, [pscustomobject]@{ id = '222'; name = 'Viewer' })
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 1
+            (Get-Calls '^POST ').Count | Should -Be 0
+            ($global:Cr.Output | Out-String) | Should -Match 'ids 111, 222'
+        }
+        It 'logs which template was used' {
+            Invoke-Script @{ TemplateRoleId = $null } | Should -Be 0
+            $events = @(Get-Content -LiteralPath $global:Cr.LogPath | ForEach-Object { ConvertFrom-Logfmt $_ })
+            @($events | Where-Object event -eq 'template_lookup')[0].role_id | Should -Be '111'
         }
     }
 

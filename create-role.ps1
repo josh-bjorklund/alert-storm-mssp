@@ -3,32 +3,32 @@
 Creates the custom role that alert-storm-mssp.ps1 needs.
 
 .DESCRIPTION
-Builds a new role with the permissions alert-storm-mssp.ps1 uses (see its .NOTES), plus every permission those depend on. Roles are made of numeric permission ids, and the API has no standalone permission catalog, so the ids are read from an existing role (-TemplateRoleId) in the same scope: each needed permission is found by its page and type (for example page threats, type updateIncidentStatus) and its dependsOn chain is followed. The role's permissions are then checked after it is created.
+Creates a role with the permissions listed under "Required permissions" in README.md, plus the permissions they depend on. Permission ids are read from a template role (the predefined Viewer role unless -TemplateRoleId is given), and the new role is checked after it is created.
 
-Needed permissions (swagger name -> console page / permission):
-  Threats.view, Threats.updateIncidentStatus, Threats.updateAnalystVerdict, Threats.unquarantine  -> Endpoint Threats
-  Custom Alerts.view, Custom Alerts.updateIncidentStatus, Custom Alerts.updateAnalystVerdict      -> STAR Rule Alerts
-View is included because the console's role definition makes the update permissions depend on it; a missing View is the likely cause of an HTTP 403 on the update calls.
+Intended to be run by an administrative user, not by the API user that runs alert-storm-mssp.ps1; that user only needs the role this script creates.
 
 Exit code: 0 on success (including declining the prompt), 1 if anything failed.
 
 .PARAMETER Server
-Management console base URL, e.g. https://usea1-123.sentinelone.net (a trailing slash is trimmed).
+Console base URL, e.g. https://usea1-123.sentinelone.net.
 
 .PARAMETER ApiToken
-API token, as a SecureString. The token's user needs Roles.create (and Roles.view to read the template role).
+API token, as a SecureString, of a user that can create roles (Roles.create).
 
 .PARAMETER TemplateRoleId
-Id of an existing role in the same scope, used only to read permission ids. It isn't changed. Any role works; one that already runs alert-storm-mssp.ps1 is ideal.
+Role to read permission ids from; it isn't changed. Default: the predefined Viewer role.
 
 .PARAMETER AccountId
-Create the role in this account. Give exactly one of -AccountId, -SiteId or -GroupId.
+Create the role in this account. Give at most one of -AccountId, -SiteId, -GroupId or -Global.
 
 .PARAMETER SiteId
 Create the role in this site.
 
 .PARAMETER GroupId
 Create the role in this group.
+
+.PARAMETER Global
+Create the role at the global (tenant) level. This is the default with no scope option, and the widest scope; a narrower one is better for least privilege.
 
 .PARAMETER RoleName
 Name of the new role. Default: alert-storm-mssp.
@@ -37,20 +37,23 @@ Name of the new role. Default: alert-storm-mssp.
 Description of the new role. Default: Permissions required by alert-storm-mssp.ps1 to resolve alerts and threats.
 
 .PARAMETER SkipUnquarantine
-Leave out Threats.unquarantine (only needed if you answer Y to alert-storm-mssp.ps1's un-quarantine prompt).
+Leave out Threats.unquarantine (needed only if you answer Y to the un-quarantine prompt).
 
 .PARAMETER IncludeTemplatePermissions
-Also grant every permission the template role already grants, so the new role matches it plus the needed ones. Without it the role has only the needed permissions and their dependencies.
+Also grant everything the template role grants.
 
 .PARAMETER MaxRetries
-Retries when the console answers HTTP 429 (rate limited), 0-10. Waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). Default: 5.
+Retries on HTTP 429 (waits for Retry-After, else backs off), 0-10. Default: 5.
 
 .PARAMETER LogPath
-File that structured logs are appended to, one logfmt line per event, tagged with a run_id. The token is only logged masked. Default: ./create-role.log (relative to the current directory). The run stops before any API call if the file cannot be written.
+Structured (logfmt) log, appended and tagged with a run_id; the token is masked. Default: ./create-role.log. The run stops if it can't be written.
 
 .EXAMPLE
 $token = Read-Host -AsSecureString -Prompt 'API token'
-./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId 1240742237818218246 -TemplateRoleId 1234567890123456789
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId <site id>
+
+.EXAMPLE
+./create-role.ps1 -Server https://usea1-123.sentinelone.net -ApiToken $token -SiteId <site id> -TemplateRoleId <role id>
 #>
 
 param(
@@ -61,7 +64,6 @@ param(
     [Parameter(Mandatory = $true)]
     [securestring]$ApiToken,
 
-    [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+$')]
     [string]$TemplateRoleId,
 
@@ -73,6 +75,8 @@ param(
 
     [ValidatePattern('^\d+$')]
     [string]$GroupId,
+
+    [switch]$Global,
 
     [ValidateLength(1, 255)]
     [string]$RoleName = 'alert-storm-mssp',
@@ -92,19 +96,23 @@ param(
 
 $Server = $Server.TrimEnd('/')
 
+# With no scope option the role is created at the global (tenant) level.
+$GlobalByDefault = -not ($AccountId -or $SiteId -or $GroupId -or $Global)
 $scopes = @(
     @(
-        @{ Key = 'accountIds'; Value = $AccountId }
-        @{ Key = 'siteIds'; Value = $SiteId }
-        @{ Key = 'groupIds'; Value = $GroupId }
-    ) | Where-Object { $_.Value }
+        @{ Given = [bool]$AccountId; Name = 'accountIds'; Id = $AccountId; Filter = @{ accountIds = @($AccountId) }; Query = "accountIds=$AccountId" }
+        @{ Given = [bool]$SiteId; Name = 'siteIds'; Id = $SiteId; Filter = @{ siteIds = @($SiteId) }; Query = "siteIds=$SiteId" }
+        @{ Given = [bool]$GroupId; Name = 'groupIds'; Id = $GroupId; Filter = @{ groupIds = @($GroupId) }; Query = "groupIds=$GroupId" }
+        @{ Given = ([bool]$Global -or $GlobalByDefault); Name = 'tenant'; Id = ''; Filter = @{ tenant = $true }; Query = 'tenant=true' }
+    ) | Where-Object { $_.Given }
 )
 if ($scopes.Count -ne 1) {
-    throw "Specify exactly one of -AccountId, -SiteId or -GroupId."
+    throw "Specify only one of -AccountId, -SiteId, -GroupId or -Global (with none, the role is created at the global level)."
 }
-$ScopeKey = $scopes[0].Key
-$ScopeValue = $scopes[0].Value
-$ScopeQuery = "$ScopeKey=$ScopeValue"
+$ScopeName = $scopes[0].Name
+$ScopeId = $scopes[0].Id
+$ScopeFilter = $scopes[0].Filter
+$ScopeQuery = $scopes[0].Query
 
 # Swagger permission name -> the console role page identifier and permission type it appears as in GET /rbac/role/{id}.
 $NeededPermissions = @(
@@ -375,9 +383,10 @@ function Get-RolePermissionIndex {
 Write-Log info run_start ([ordered]@{
         server           = ([uri]$Server).Host
         token            = $MaskedToken
-        template_role_id = $TemplateRoleId
-        scope            = $ScopeKey
-        scope_id         = $ScopeValue
+        template_role_id = $(if ($TemplateRoleId) { $TemplateRoleId } else { 'predefined Viewer (lookup)' })
+        scope            = $ScopeName
+        scope_id         = $ScopeId
+        scope_default    = $GlobalByDefault
         role_name        = $RoleName
         skip_unquarantine = [bool]$SkipUnquarantine
         include_template_permissions = [bool]$IncludeTemplatePermissions
@@ -389,12 +398,27 @@ Write-Log info run_start ([ordered]@{
 
 Write-Host "=== Create role '$RoleName' ===" -ForegroundColor Yellow
 Write-Host "Console: $Server"
-Write-Host "Scope:   $ScopeKey=$ScopeValue"
+Write-Host "Scope:   $(if ($ScopeName -eq 'tenant') { 'global (tenant)' + $(if ($GlobalByDefault) { ' [default]' }) } else { $ScopeQuery })"
 Write-Host "Log:     $($script:LogFile) (run_id $($script:RunId))"
 Write-Host ""
 
 $plan = $null
 try {
+    # ---- 0. Find the template role: the predefined Viewer role, unless -TemplateRoleId was given ----
+    if (-not $TemplateRoleId) {
+        $found = Invoke-S1Api -Uri "$Server/web/api/v2.1/rbac/roles?name=Viewer&predefinedRole=true" -Operation find_viewer_role
+        $viewers = @(@($found.data) | Where-Object { $_.name -eq 'Viewer' })
+        if ($viewers.Count -eq 0) {
+            throw "Could not find the predefined Viewer role to use as the template. Pass -TemplateRoleId with the id of a role to read permission ids from."
+        }
+        if ($viewers.Count -gt 1) {
+            throw "More than one predefined role is named Viewer (ids $(($viewers | ForEach-Object { $_.id }) -join ', ')). Pass -TemplateRoleId to choose one."
+        }
+        $TemplateRoleId = [string]$viewers[0].id
+        Write-Host "[=] Template role: predefined Viewer (id $TemplateRoleId)"
+        Write-Log info template_lookup ([ordered]@{ role_name = 'Viewer'; role_id = $TemplateRoleId })
+    }
+
     # ---- 1. Read permission ids from the template role ----
     $templateResponse = Invoke-S1Api -Uri "$Server/web/api/v2.1/rbac/role/${TemplateRoleId}?$ScopeQuery" -Operation get_template_role
     $template = Get-RolePermissionIndex -Role $templateResponse.data
@@ -476,7 +500,7 @@ try {
                 description   = $RoleDescription
                 permissionIds = @($plan.Keys)
             }
-            filter = @{ $ScopeKey = @($ScopeValue) }
+            filter = $ScopeFilter
         } | ConvertTo-Json -Depth 5
         $created = Invoke-S1Api -Uri "$Server/web/api/v2.1/rbac/role" -Method Post -Body $body -Operation create_role
         $script:NewRoleId = [string]$created.data.id
