@@ -28,9 +28,9 @@ Run it from a PowerShell session, or from a shell with `pwsh -Command "./alert-s
 
 Every run appends structured logs to `-LogPath` (default `./alert-storm-mssp.log`), one [logfmt](https://brandur.org/logfmt) line per event, the same `key=value` shape as structlog's key-value renderer. Each line has `ts` (UTC), `level`, `run_id` and `event`. The run stops before any API call if the file can't be written. The log holds the console host name, endpoint paths, the hashes and a masked token (`first10*****last10`, or `*****` for a short one). It never holds the full token or URLs.
 
-Events: `run_start`, `console_release`, `api_attempt` (one per request attempt), `lookup_page` (per lookup page: `returned`, the API's `total_items`, and counts by `incident_<status>` and `mitigation_<status>`), `retry_same_size`, `batch_size_reduced`, `retries_exhausted`, `lookup_complete` (adds `api_total_items` and the status totals), `operator_choice`, `lookup_failed`, `run_end`.
+Events: `run_start`, `console_release`, `api_attempt` (one per request attempt), `lookup_page` (per lookup page: `returned`, the API's `total_items` (first page only, since the API reports 0 on later cursor pages), and counts by `incident_<status>` and `mitigation_<status>`), `retry_same_size`, `batch_size_reduced`, `retries_exhausted`, `lookup_complete` (adds `api_total_items` and the status totals), `operator_choice`, `lookup_failed`, `run_end`.
 
-On an HTTP 500 the first retry keeps the batch size, since a 500 is often transient. Each further consecutive 500 reduces it by 100 (`batch_size_reduced`). `size_retry` on an `api_attempt` shows where in that sequence the attempt was.
+On an HTTP 500 the first retry keeps the batch size, since a 500 is often transient. Each further consecutive 500 reduces it (`batch_size_reduced`, with the `step` used) by 100, then 200, 400, 800 and so on, never below 1. The step starts over at 100 after a success. `size_retry` on an `api_attempt` shows where in that sequence the attempt was.
 
 ```
 ts=2026-10-14T17:58:42.568Z level=info run_id=f1abc4de9b64 event=api_attempt operation=threat_resolve method=POST endpoint=/web/api/v2.1/threats/incident batch_size=500 size_retry=0 attempt=1 outcome=ok duration_ms=812 affected=500

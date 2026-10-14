@@ -41,7 +41,7 @@ Per-call limit for STAR alert calls. Default: 500.
 Delay between batches, to be gentle with rate limits (0-3600). Default: 1.
 
 .PARAMETER MaxRetries
-Retries when the console answers HTTP 429 (rate limited) or HTTP 500 (server error), 0-10. On 429 it waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). On 500 it retries the same work: the first retry keeps the batch size (a 500 is often transient), and each further consecutive 500 reduces the batch size (lookup page size, ids per un-quarantine/resolve call, or alerts per call) by 100 (never below 1), so no threat is skipped. The 500 retry count resets after any successful call; the reduced size is kept for the rest of that step. Default: 5.
+Retries when the console answers HTTP 429 (rate limited) or HTTP 500 (server error), 0-10. On 429 it waits for the Retry-After header if sent, otherwise backs off exponentially (2s, 4s, ... capped at 60s). On 500 it retries the same work: the first retry keeps the batch size (a 500 is often transient), and each further consecutive 500 reduces the batch size (lookup page size, ids per un-quarantine/resolve call, or alerts per call) by a step that doubles each time (100, then 200, 400, 800, ...; never below 1), so no threat is skipped. The 500 retry count and the step reset after any successful call; the reduced size is kept for the rest of that step. Default: 5.
 
 .PARAMETER LogPath
 File that structured logs are appended to, one logfmt line per event (key=value pairs, UTC timestamps), tagged with a run_id so many runs can share one file. Every API attempt is logged with its operation, requested batch size, outcome (ok, rate_limited, server_error, error), duration and item count, which is enough to work out which batch sizes succeed most often. The log never contains the token (only a masked form) or full URLs. Default: ./alert-storm-mssp.log (relative to the current directory). The run stops before any API call if the file cannot be written.
@@ -111,7 +111,7 @@ $script:LogFile = $null
 $LookupMinIntervalMs = 150
 # GET /threats takes the hashes in the URL; keep the hash list per request short enough for common proxy URL limits (~8 KB). More hashes than fit are looked up in several requests that feed the same single batch.
 $LookupMaxHashParamChars = 3500
-# On HTTP 500, each retry shrinks the batch by this many items.
+# On HTTP 500, the first reduction shrinks the batch by this many items; each further consecutive reduction doubles the step (100, 200, 400, ...). The step starts over after a success.
 $BatchReductionStep = 100
 # Longest we will wait on a single 429, even if Retry-After asks for more.
 $RateLimitMaxWaitSeconds = 300
@@ -486,6 +486,7 @@ function Export-ThreatIdsByHashes {
     $pageSize = $ThreatsPageSize
     $serverErrors = 0
     $retriedSameSize = $false
+    $reductions = 0
 
     $lastRequest = $null
     $writer = [System.IO.StreamWriter]::new($SpoolPath, $false)
@@ -517,6 +518,7 @@ function Export-ThreatIdsByHashes {
                         $succeeded = $true
                         $serverErrors = 0
                         $retriedSameSize = $false
+                        $reductions = 0
                     }
                     catch {
                         if ((Get-HttpStatusCode $_) -ne 500) {
@@ -535,8 +537,10 @@ function Export-ThreatIdsByHashes {
                         }
                         else {
                             $previousSize = $pageSize
-                            $pageSize = [math]::Max(1, $pageSize - $BatchReductionStep)
-                            Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_lookup'; from = $previousSize; to = $pageSize; retry = $serverErrors; max_retries = $MaxRetries })
+                            $step = $BatchReductionStep * [int][math]::Pow(2, $reductions)
+                            $reductions++
+                            $pageSize = [math]::Max(1, $pageSize - $step)
+                            Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_lookup'; from = $previousSize; to = $pageSize; step = $step; retry = $serverErrors; max_retries = $MaxRetries })
                             Write-Warning "Server error (HTTP 500) on threat lookup; retrying the same page with page size $pageSize (retry $serverErrors/$MaxRetries)."
                         }
                         Start-Sleep -Seconds $BatchDelaySeconds
@@ -564,7 +568,8 @@ function Export-ThreatIdsByHashes {
                     $script:LookupStats.ApiTotalItems += [int]$apiTotal
                 }
                 $pageFields = [ordered]@{ page = $page; returned = $pageReturned; ids_so_far = $count }
-                if ($null -ne $apiTotal) {
+                # The API only reports totalItems on a batch's first page (later cursor pages return 0), so log it only there.
+                if ($firstPageOfBatch -and $null -ne $apiTotal) {
                     $pageFields['total_items'] = [int]$apiTotal
                 }
                 Add-StatusFields -Fields $pageFields -Incident $pageIncident -Mitigation $pageMitigation
@@ -661,6 +666,7 @@ function Resolve-ThreatIdsFromSpool {
     $size = $ThreatsBatchLimit
     $serverErrors = 0
     $retriedSameSize = $false
+    $reductions = 0
     $chunkNumber = 0
     $removed = 0                # ids taken off $pending, whether they succeeded or failed
     $unquarantinedAhead = 0     # leading ids in $pending already un-quarantined (their resolve hit a 500), so a retry does not repeat it
@@ -690,6 +696,7 @@ function Resolve-ThreatIdsFromSpool {
                     $unquarantinedAhead = [math]::Max(0, $unquarantinedAhead - $take)
                     $serverErrors = 0
                     $retriedSameSize = $false
+                    $reductions = 0
                     if ($pending.Count -gt 0 -or $reader.Peek() -ge 0) {
                         Start-Sleep -Seconds $BatchDelaySeconds
                     }
@@ -722,8 +729,10 @@ function Resolve-ThreatIdsFromSpool {
                     }
                     else {
                         $previousSize = $size
-                        $size = [math]::Max(1, $size - $BatchReductionStep)
-                        Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_resolve'; from = $previousSize; to = $size; retry = $serverErrors; max_retries = $MaxRetries; pending_ids = $pending.Count })
+                        $step = $BatchReductionStep * [int][math]::Pow(2, $reductions)
+                        $reductions++
+                        $size = [math]::Max(1, $size - $step)
+                        Write-Log warn batch_size_reduced ([ordered]@{ operation = 'threat_resolve'; from = $previousSize; to = $size; step = $step; retry = $serverErrors; max_retries = $MaxRetries; pending_ids = $pending.Count })
                         Write-Warning "Retrying the same $($pending.Count) pending ids in chunks of up to $size (retry $serverErrors/$MaxRetries)."
                     }
                     Start-Sleep -Seconds $BatchDelaySeconds
@@ -754,6 +763,7 @@ function Resolve-CloudDetectionAlertsByHashes {
     $limit = $AlertsBatchLimit
     $serverErrors = 0
     $retriedSameSize = $false
+    $reductions = 0
 
     while ($true) {
         $batch++
@@ -801,8 +811,10 @@ function Resolve-CloudDetectionAlertsByHashes {
                 }
                 else {
                     $previousLimit = $limit
-                    $limit = [math]::Max(1, $limit - $BatchReductionStep)
-                    Write-Log warn batch_size_reduced ([ordered]@{ operation = 'alert_resolve'; from = $previousLimit; to = $limit; retry = $serverErrors; max_retries = $MaxRetries; filter = $HashFilterKey })
+                    $step = $BatchReductionStep * [int][math]::Pow(2, $reductions)
+                    $reductions++
+                    $limit = [math]::Max(1, $limit - $step)
+                    Write-Log warn batch_size_reduced ([ordered]@{ operation = 'alert_resolve'; from = $previousLimit; to = $limit; step = $step; retry = $serverErrors; max_retries = $MaxRetries; filter = $HashFilterKey })
                     Write-Warning "Server error (HTTP 500) resolving STAR alerts; retrying with limit $limit (retry $serverErrors/$MaxRetries)."
                 }
                 Start-Sleep -Seconds $BatchDelaySeconds
@@ -816,6 +828,7 @@ function Resolve-CloudDetectionAlertsByHashes {
 
         $serverErrors = 0
         $retriedSameSize = $false
+        $reductions = 0
         $affected = Get-AffectedCount $response
         Write-Host "[+] Alerts batch #$batch affected: $affected"
 

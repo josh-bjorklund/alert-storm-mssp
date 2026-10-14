@@ -95,7 +95,7 @@ Describe 'alert-storm-mssp.ps1' {
                                     mitigationStatus = $(if ($st) { $st.mitigation } else { 'not_mitigated' })
                                 } }
                         })
-                        pagination = [pscustomobject]@{ nextCursor = $next; totalItems = $all.Count }
+                        pagination = [pscustomobject]@{ nextCursor = $next; totalItems = $(if ($query['cursor']) { 0 } else { $all.Count }) }
                     }
                 }
                 '^POST /web/api/v2\.1/threats/(incident|mitigate/un-quarantine)$' {
@@ -543,12 +543,12 @@ Describe 'alert-storm-mssp.ps1' {
             $global:Asm.Ids = [string[]](1..1000 | ForEach-Object { "1000000000000{0:D4}" -f $_ })
             $global:Asm.ThreatIds = $global:Asm.Ids
         }
-        It 'retries a too-large resolve chunk once at the same size, then 100 smaller each time, and resolves every id exactly once' {
+        It 'retries a too-large resolve chunk once at the same size, then with a doubling reduction, and resolves every id exactly once' {
             $global:Asm.MaxSize = @{ Ids = 250 }
             Invoke-Script @{ ThreatsBatchLimit = 500 } | Should -Be 0
             $calls = Get-Calls 'POST .*/threats/incident'
-            # 500 is rejected and retried once at 500, then 400 and 300 are rejected, then 200 is accepted and kept for the rest of the step
-            @($calls | ForEach-Object { @($_.Body.filter.ids).Count }) | Should -Be @(500, 500, 400, 300, 200, 200, 200, 200, 200)
+            # 500 is rejected and retried once at 500, then 400 is rejected (step 100), then 200 is accepted (step 200) and kept for the rest of the step
+            @($calls | ForEach-Object { @($_.Body.filter.ids).Count }) | Should -Be @(500, 500, 400, 200, 200, 200, 200, 200)
             $sent = @($calls | Where-Object { @($_.Body.filter.ids).Count -le 250 } | ForEach-Object { $_.Body.filter.ids })
             $sent.Count | Should -Be 1000
             ($sent | Sort-Object -Unique).Count | Should -Be 1000
@@ -594,7 +594,22 @@ Describe 'alert-storm-mssp.ps1' {
             $global:Asm.MaxSize = @{ Ids = 250 }
             Invoke-Script @{ ThreatsBatchLimit = 500 } | Should -Be 0
             @(Get-LogEvents 'retry_same_size').Count | Should -Be 1
-            @(Get-LogEvents 'batch_size_reduced').Count | Should -Be 3
+            @(Get-LogEvents 'batch_size_reduced').Count | Should -Be 2
+        }
+        It 'doubles the reduction step on each consecutive 500: 100, 200, 400, 800, ...' {
+            $global:Asm.ThreatIds = [string[]](1..5 | ForEach-Object { "10000000000000$_" })
+            $global:Asm.MaxSize = @{ Ids = 1 }
+            Invoke-Script @{ ThreatsBatchLimit = 5000; MaxRetries = 10 } | Should -Be 0
+            $red = @(Get-LogEvents 'batch_size_reduced')
+            @($red | ForEach-Object { $_.step }) | Should -Be @('100', '200', '400', '800', '1600', '3200')
+            @($red | ForEach-Object { "$($_.from)>$($_.to)" }) | Should -Be @('5000>4900', '4900>4700', '4700>4300', '4300>3500', '3500>1900', '1900>1')
+        }
+        It 'starts the step over at 100 after a success' {
+            $global:Asm.ServerError = @{ Pattern = 'POST .*/threats/incident'; Fail = @(1, 2, 4, 5); N = 0 }
+            Invoke-Script @{ ThreatsBatchLimit = 500; MaxRetries = 2 } | Should -Be 0
+            $red = @(Get-LogEvents 'batch_size_reduced')
+            @($red | ForEach-Object { $_.step }) | Should -Be @('100', '100')
+            @($red | ForEach-Object { "$($_.from)>$($_.to)" }) | Should -Be @('500>400', '400>300')
         }
         It 'resets the retry count after a success' {
             # incident calls 1,2 fail, 3 succeeds (retry count resets), then 4,5 fail and 6 succeeds. MaxRetries=2 would be exceeded without a reset.
@@ -642,7 +657,7 @@ Describe 'alert-storm-mssp.ps1' {
             $global:Asm.MaxSize = @{ Page = 700 }
             Invoke-Script | Should -Be 0
             $limits = @((Get-Calls '^GET .*/threats\?') | ForEach-Object { [regex]::Match($_.Uri, 'limit=(\d+)').Groups[1].Value })
-            $limits | Should -Be @('1000', '1000', '900', '800', '700', '700', '700')
+            $limits | Should -Be @('1000', '1000', '900', '700', '700', '700')
             $sent = @((Get-Calls 'POST .*/threats/incident') | ForEach-Object { $_.Body.filter.ids })
             $sent.Count | Should -Be 1500
             ($sent | Sort-Object -Unique).Count | Should -Be 1500
@@ -661,7 +676,7 @@ Describe 'alert-storm-mssp.ps1' {
             Invoke-Script @{ AlertsBatchLimit = 500 } | Should -Be 0
             $global:Asm.AlertsRemaining | Should -Be 0
             $limits = @((Get-Calls 'POST .*/alerts/analyst-verdict') | ForEach-Object { $_.Body.filter.limit })
-            $limits[0..3] | Should -Be @(500, 500, 400, 300)
+            $limits[0..3] | Should -Be @(500, 500, 400, 200)
         }
         It 'gives up on alerts after MaxRetries 500s and exits 1' {
             $global:Asm.ThreatIds = [string[]]@()
@@ -713,11 +728,12 @@ Describe 'alert-storm-mssp.ps1' {
             $global:Asm.MaxSize = @{ Ids = 250 }
             Invoke-Script @{ ThreatsBatchLimit = 500 } | Should -Be 0
             $resolves = @(Get-LogEvents 'api_attempt' | Where-Object { $_.operation -eq 'threat_resolve' })
-            @($resolves | ForEach-Object { "$($_.batch_size):$($_.outcome)" }) | Should -Be @('500:server_error', '500:server_error', '400:server_error', '300:server_error', '200:ok', '200:ok', '200:ok', '200:ok', '200:ok')
+            @($resolves | ForEach-Object { "$($_.batch_size):$($_.outcome)" }) | Should -Be @('500:server_error', '500:server_error', '400:server_error', '200:ok', '200:ok', '200:ok', '200:ok', '200:ok')
             @($resolves | Where-Object { $_.outcome -eq 'server_error' } | ForEach-Object { $_.http_status } | Sort-Object -Unique) | Should -Be '500'
-            @($resolves | ForEach-Object { $_.size_retry }) | Should -Be @('0', '1', '2', '3', '4', '0', '0', '0', '0')
+            @($resolves | ForEach-Object { $_.size_retry }) | Should -Be @('0', '1', '2', '3', '0', '0', '0', '0')
             $reductions = @(Get-LogEvents 'batch_size_reduced')
-            @($reductions | ForEach-Object { "$($_.from)>$($_.to)" }) | Should -Be @('500>400', '400>300', '300>200')
+            @($reductions | ForEach-Object { "$($_.from)>$($_.to)" }) | Should -Be @('500>400', '400>200')
+            @($reductions | ForEach-Object { $_.step }) | Should -Be @('100', '200')
         }
         It 'logs a 429 as rate_limited with an increasing attempt number' {
             $global:Asm.RateLimit = @{ Pattern = '^GET .*/threats\?'; Remaining = 2 }
@@ -779,6 +795,7 @@ Describe 'alert-storm-mssp.ps1' {
             $pages.Count | Should -Be 2
             $pages[0].returned | Should -Be '500'
             $pages[0].total_items | Should -Be '1000'
+            $pages[1].Keys | Should -Not -Contain 'total_items'     # the API reports 0 on cursor pages, so it is not logged there
             $pages[0].incident_resolved | Should -Be '300'
             $pages[0].incident_unresolved | Should -Be '200'
             $pages[0].incident_in_progress | Should -Be '0'
